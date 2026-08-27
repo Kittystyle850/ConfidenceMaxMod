@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <vector>
 #include <string>
+#include <cstdio>
 
 // Indirizzi per il salto di ritorno
 uintptr_t returnAddress = 0;
@@ -58,12 +59,25 @@ uintptr_t FindPattern(const char* pattern, const char* mask) {
     return 0;
 }
 
+void WriteLog(const std::string& msg) {
+    FILE* f = nullptr;
+    fopen_s(&f, "ConfidenceMaxMod_log.txt", "a");
+    if (f) {
+        fprintf(f, "%s\n", msg.c_str());
+        fclose(f);
+    }
+}
+
 DWORD WINAPI MainThread(LPVOID lpReserved) {
-    // Il tuo AOB esatto: 8B 80 C4 00 00 00 85 C0 39 3F 0F B6 47 5F
+    // AOB esatto, identico a quello dello script Cheat Engine (nessun wildcard)
     const char* aob = "\x8B\x80\xC4\x00\x00\x00\x85\xC0\x39\x3F\x0F\xB6\x47\x5F";
-    const char* mask = "xxxxxx????????"; // Mascheriamo i byte successivi per maggiore stabilità
+    const char* mask = "xxxxxxxxxxxxxx"; // 14 byte tutti esatti, come aobscan() in CE
 
     uintptr_t hookAddress = FindPattern(aob, mask);
+
+    char buf[128];
+    sprintf_s(buf, "AOB trovato a: 0x%08X", (unsigned int)hookAddress);
+    WriteLog(hookAddress ? buf : "AOB NON TROVATO - pattern non presente in memoria");
 
     if (hookAddress) {
         // Calcola l'indirizzo di ritorno (hookAddress + 6 byte istruzione originale)
@@ -82,6 +96,8 @@ DWORD WINAPI MainThread(LPVOID lpReserved) {
 
         // Ripristina la protezione della memoria
         VirtualProtect((void*)hookAddress, 6, oldProtect, &oldProtect);
+
+        WriteLog("Hook JMP scritto correttamente.");
     }
 
     return TRUE;
