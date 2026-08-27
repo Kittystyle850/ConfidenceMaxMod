@@ -1,0 +1,28 @@
+name: Build Mod DLL
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout del codice
+      uses: actions/checkout@v4
+
+    - name: Configura CMake
+      run: cmake -B ${{github.workspace}}/build -A Win32
+
+    - name: Compila il progetto
+      run: cmake --build ${{github.workspace}}/build --config Release
+
+    - name: Carica la DLL compilata
+      uses: actions/upload-artifact@v4
+      with:
+        name: ConfidenceMaxMod
+        path: ${{github.workspace}}/build/Release/ConfidenceMaxMod.dll
