@@ -1,4 +1,21 @@
+# Build output
 build/
 *.dll
 *.pdb
 *.obj
+*.exp
+*.lib
+
+# Log del trainer
+MindCopTrainer_log.txt
+ConfidenceMaxMod_log.txt
+
+# Visual Studio / CMake
+.vs/
+out/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.vcxproj*
+*.sln
+*.user
