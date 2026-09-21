@@ -1,4 +1,4 @@
-name: Build Mod DLL
+name: Build MindCop Trainer DLL
 
 on:
   push:
@@ -15,8 +15,8 @@ jobs:
     - name: Checkout del codice
       uses: actions/checkout@v4
 
-    - name: Configura CMake
-      run: cmake -B ${{github.workspace}}/build -A Win32
+    - name: Configura CMake (x64!)
+      run: cmake -B ${{github.workspace}}/build -A x64
 
     - name: Compila il progetto
       run: cmake --build ${{github.workspace}}/build --config Release
@@ -24,5 +24,5 @@ jobs:
     - name: Carica la DLL compilata
       uses: actions/upload-artifact@v4
       with:
-        name: ConfidenceMaxMod
-        path: ${{github.workspace}}/build/Release/ConfidenceMaxMod.dll
+        name: MindCopTrainer
+        path: ${{github.workspace}}/build/Release/MindCopTrainer.dll
