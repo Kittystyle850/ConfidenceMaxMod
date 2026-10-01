@@ -1,13 +1,13 @@
 cmake_minimum_required(VERSION 3.15)
-project(MindCopTrainer VERSION 1.1 LANGUAGES CXX)
+project(CT2CheatDLL VERSION 1.0 LANGUAGES CXX ASM_MASM)
 
-# MindCop.exe è x64 (base 0x140000000).
-# NON forzare Win32 o la DLL non sarà iniettabile.
-# Se un domani il gioco diventasse 32-bit, aggiungi:
-#   set(CMAKE_GENERATOR_PLATFORM Win32)
-# oppure passa -A Win32 al comando cmake.
+# CaptainTsubasa2WF-Win64-Shipping.exe is x64. Do NOT force Win32.
 
-add_library(MindCopTrainer SHARED main.cpp)
+add_library(CT2CheatDLL SHARED main.cpp hooks.asm)
 
-target_compile_options(MindCopTrainer PRIVATE /O2 /Ob2 /Oi /Ot /EHsc)
-target_compile_definitions(MindCopTrainer PRIVATE UNICODE _UNICODE)
+set_source_files_properties(hooks.asm PROPERTIES LANGUAGE ASM_MASM)
+
+target_compile_options(CT2CheatDLL PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:/O2 /Ob2 /Oi /Ot /EHsc>
+)
+target_compile_definitions(CT2CheatDLL PRIVATE UNICODE _UNICODE)
