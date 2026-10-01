@@ -1,4 +1,4 @@
-name: Build MindCop Trainer DLL
+name: Build CT2CheatDLL
 
 on:
   push:
@@ -15,7 +15,7 @@ jobs:
     - name: Checkout del codice
       uses: actions/checkout@v4
 
-    - name: Configura CMake (x64)
+    - name: Configura CMake (x64, abilita MASM)
       run: cmake -B ${{github.workspace}}/build -A x64
 
     - name: Compila il progetto
@@ -24,5 +24,5 @@ jobs:
     - name: Carica la DLL compilata
       uses: actions/upload-artifact@v4
       with:
-        name: MindCopTrainer
-        path: ${{github.workspace}}/build/Release/MindCopTrainer.dll
+        name: CT2CheatDLL
+        path: ${{github.workspace}}/build/Release/CT2CheatDLL.dll
