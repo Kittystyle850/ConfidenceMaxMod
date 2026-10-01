@@ -137,21 +137,96 @@ static uintptr_t FindPattern(uintptr_t base, size_t size, const char* patStr) {
 //  E9 rel32 -> target, padded with NOP. Returns addr+patchLen
 //  (the "return address" for mid-function hooks).
 // ============================================================
+// ------------------------------------------------------------
+//  Near-memory trampoline allocator.
+//  ------------------------------------------------------------
+//  A DLL loaded via LoadLibrary can land anywhere in the process'
+//  address space; on this game it was observed ~0x7C80000000 bytes
+//  away from the module base, far outside the +-2GB an E9 rel32 jmp
+//  can reach. Rather than relocating our codecaves (which would
+//  break every RIP-relative reference to the flag/return-pointer
+//  globals), we reserve one small RWX page close to the game module
+//  and bump-allocate 14-byte absolute-jump stubs from it on demand:
+//      FF 25 00 00 00 00      ; jmp qword ptr [rip+0]
+//      <8 bytes: absolute target address>
+//  The patched game code jmps (in range) to the stub, which then
+//  jmps (unrestricted, absolute) to the real codecave.
+// ------------------------------------------------------------
+struct NearStubAllocator {
+    uint8_t* page = nullptr;
+    size_t   used = 0;
+    static constexpr size_t kPageSize = 0x1000; // room for ~290 stubs, we need <20
+
+    bool EnsurePage(uintptr_t nearTarget) {
+        if (page) return true;
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        const uintptr_t gran = si.dwAllocationGranularity;
+        for (uintptr_t delta = 0; delta < 0x70000000ULL; delta += gran) {
+            for (int sign = -1; sign <= 1; sign += 2) {
+                uintptr_t cand = nearTarget + static_cast<uintptr_t>(static_cast<int64_t>(sign) * static_cast<int64_t>(delta));
+                cand &= ~static_cast<uintptr_t>(gran - 1);
+                void* p = VirtualAlloc(reinterpret_cast<LPVOID>(cand), kPageSize,
+                                        MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                if (!p) continue;
+                int64_t diff = static_cast<int64_t>(reinterpret_cast<uintptr_t>(p)) - static_cast<int64_t>(nearTarget);
+                if (diff > -0x70000000LL && diff < 0x70000000LL) {
+                    page = reinterpret_cast<uint8_t*>(p);
+                    WriteLog("[i] near-stub page allocated @ 0x%llX (target 0x%llX, delta 0x%llX)",
+                             (unsigned long long)p, (unsigned long long)nearTarget, (unsigned long long)diff);
+                    return true;
+                }
+                VirtualFree(p, 0, MEM_RELEASE);
+            }
+        }
+        return false;
+    }
+
+    void* MakeTrampoline(uintptr_t nearTarget, void* realTarget) {
+        if (!EnsurePage(nearTarget)) return nullptr;
+        if (used + 14 > kPageSize) { WriteLog("[!] near-stub page exhausted"); return nullptr; }
+        uint8_t* stub = page + used;
+        used += 14;
+        stub[0] = 0xFF; stub[1] = 0x25;
+        *reinterpret_cast<uint32_t*>(stub + 2) = 0;
+        *reinterpret_cast<uint64_t*>(stub + 6) = reinterpret_cast<uint64_t>(realTarget);
+        FlushInstructionCache(GetCurrentProcess(), stub, 14);
+        return stub;
+    }
+};
+static NearStubAllocator g_stubs;
+
+// Writes E9 rel32 -> target at addr (+NOP padding to patchLen). If target is
+// out of +-2GB range, transparently routes through a near trampoline first.
+// Returns addr+patchLen on success (the mid-function "return address" to
+// resume original execution from), or 0 on failure.
 static uintptr_t WriteJmpHook(uintptr_t addr, void* target, int patchLen) {
     if (patchLen < 5) { WriteLog("[!] patchLen<5 @ 0x%llX", (unsigned long long)addr); return 0; }
+
+    int64_t rel = reinterpret_cast<int64_t>(target) - (static_cast<int64_t>(addr) + 5);
+    if (rel < INT32_MIN || rel > INT32_MAX) {
+        void* stub = g_stubs.MakeTrampoline(addr, target);
+        if (!stub) {
+            WriteLog("[!] out of range @ 0x%llX (target 0x%llX) and stub allocation FAILED",
+                     (unsigned long long)addr, (unsigned long long)target);
+            return 0;
+        }
+        WriteLog("[i] 0x%llX too far from 0x%llX, routed via near stub @ 0x%llX",
+                 (unsigned long long)addr, (unsigned long long)target, (unsigned long long)stub);
+        target = stub;
+        rel = reinterpret_cast<int64_t>(target) - (static_cast<int64_t>(addr) + 5);
+        if (rel < INT32_MIN || rel > INT32_MAX) {
+            WriteLog("[!] stub still out of range, giving up @ 0x%llX", (unsigned long long)addr);
+            return 0;
+        }
+    }
+
     DWORD oldProt = 0;
     if (!VirtualProtect(reinterpret_cast<LPVOID>(addr), patchLen, PAGE_EXECUTE_READWRITE, &oldProt)) {
         WriteLog("[!] VirtualProtect failed @ 0x%llX (err=%lu)", (unsigned long long)addr, GetLastError());
         return 0;
     }
     uint8_t* p = reinterpret_cast<uint8_t*>(addr);
-    int64_t rel = reinterpret_cast<int64_t>(target) - (static_cast<int64_t>(addr) + 5);
-    if (rel < INT32_MIN || rel > INT32_MAX) {
-        WriteLog("[!] codecave out of +-2GB range @ 0x%llX (target 0x%llX)",
-                 (unsigned long long)addr, (unsigned long long)target);
-        VirtualProtect(reinterpret_cast<LPVOID>(addr), patchLen, oldProt, &oldProt);
-        return 0;
-    }
     p[0] = 0xE9;
     *reinterpret_cast<int32_t*>(p + 1) = static_cast<int32_t>(rel);
     for (int i = 5; i < patchLen; ++i) p[i] = 0x90; // NOP padding
@@ -213,57 +288,40 @@ static void ApplyUniqueLimitPatch(bool enable) {
 // ============================================================
 //  Install
 // ============================================================
+
+// Finds `pattern`, writes the jmp hook (transparently via a near
+// stub if needed) and logs success/failure honestly — this used to
+// be duplicated 9x with the success log printed unconditionally
+// even when WriteJmpHook had just failed and returned 0.
+static bool InstallOne(const char* name, uintptr_t base, size_t size,
+                        const char* pattern, void* hookFn, int patchLen,
+                        uint64_t* retSlot) {
+    uintptr_t a = FindPattern(base, size, pattern);
+    if (!a) { WriteLog("[!] %-18s AOB not found", name); return false; }
+
+    uintptr_t ret = WriteJmpHook(a, hookFn, patchLen);
+    if (!ret) { WriteLog("[!] %-18s FOUND @ 0x%llX but hook install FAILED", name, (unsigned long long)a); return false; }
+
+    if (retSlot) *retSlot = ret;
+    WriteLog("[+] %-18s @ 0x%llX", name, (unsigned long long)a);
+    return true;
+}
+
 static bool InstallHooks(uintptr_t base, size_t size) {
     bool allOk = true;
 
-    uintptr_t a;
-
-    a = FindPattern(base, size, PAT_SHOT_TICK);
-    if (a) { g_ret_shot_tick = WriteJmpHook(a, (void*)&ct2_shot_tick_hook, 8);
-              WriteLog("[+] shot_tick @ 0x%llX", (unsigned long long)a); }
-    else { allOk = false; WriteLog("[!] shot_tick AOB not found"); }
-
-    a = FindPattern(base, size, PAT_SHOT_RELEASE);
-    if (a) { g_ret_shot_release = WriteJmpHook(a, (void*)&ct2_shot_release_hook, 8);
-              WriteLog("[+] shot_release @ 0x%llX", (unsigned long long)a); }
-    else { allOk = false; WriteLog("[!] shot_release AOB not found"); }
-
-    a = FindPattern(base, size, PAT_CHAIN_LVLSET);
-    if (a) { g_ret_chain_level_set = WriteJmpHook(a, (void*)&ct2_chain_level_set_hook, 10);
-              WriteLog("[+] chain_level_set @ 0x%llX", (unsigned long long)a); }
-    else { allOk = false; WriteLog("[!] chain_level_set AOB not found"); }
-
-    a = FindPattern(base, size, PAT_DUEL_DRIBBLE);
-    if (a) { WriteJmpHook(a, (void*)&ct2_duel_dribble_hook, 7);
-              WriteLog("[+] duel_dribble @ 0x%llX", (unsigned long long)a); }
-    else { allOk = false; WriteLog("[!] duel_dribble AOB not found"); }
-
-    a = FindPattern(base, size, PAT_SDRIBBLE_END);
-    if (a) { g_ret_sdribble_end = WriteJmpHook(a, (void*)&ct2_sdribble_end_hook, 6);
-              WriteLog("[+] sdribble_end @ 0x%llX", (unsigned long long)a); }
-    else { allOk = false; WriteLog("[!] sdribble_end AOB not found"); }
-
-    a = FindPattern(base, size, PAT_SDRIBBLE_DIR);
-    if (a) { g_ret_sdribble_direct = WriteJmpHook(a, (void*)&ct2_sdribble_direct_hook, 6);
-              WriteLog("[+] sdribble_direct @ 0x%llX", (unsigned long long)a); }
-    else { allOk = false; WriteLog("[!] sdribble_direct AOB not found"); }
-
-    a = FindPattern(base, size, PAT_SDRIBBLE_CD);
-    if (a) { g_ret_sdribble_cooldown = WriteJmpHook(a, (void*)&ct2_sdribble_cooldown_hook, 8);
-              WriteLog("[+] sdribble_cooldown @ 0x%llX", (unsigned long long)a); }
-    else { allOk = false; WriteLog("[!] sdribble_cooldown AOB not found"); }
-
-    a = FindPattern(base, size, PAT_NTCHARGE_TICK);
-    if (a) { g_ret_ntcharge_tick = WriteJmpHook(a, (void*)&ct2_ntcharge_tick_hook, 8);
-              WriteLog("[+] ntcharge_tick @ 0x%llX", (unsigned long long)a); }
-    else { allOk = false; WriteLog("[!] ntcharge_tick AOB not found"); }
-
-    a = FindPattern(base, size, PAT_NTCHARGE_REL);
-    if (a) { g_ret_ntcharge_release = WriteJmpHook(a, (void*)&ct2_ntcharge_release_hook, 7);
-              WriteLog("[+] ntcharge_release @ 0x%llX", (unsigned long long)a); }
-    else { allOk = false; WriteLog("[!] ntcharge_release AOB not found"); }
+    allOk &= InstallOne("shot_tick",         base, size, PAT_SHOT_TICK,    (void*)&ct2_shot_tick_hook,        8,  &g_ret_shot_tick);
+    allOk &= InstallOne("shot_release",      base, size, PAT_SHOT_RELEASE, (void*)&ct2_shot_release_hook,     8,  &g_ret_shot_release);
+    allOk &= InstallOne("chain_level_set",   base, size, PAT_CHAIN_LVLSET, (void*)&ct2_chain_level_set_hook,  10, &g_ret_chain_level_set);
+    allOk &= InstallOne("duel_dribble",      base, size, PAT_DUEL_DRIBBLE, (void*)&ct2_duel_dribble_hook,     7,  nullptr);
+    allOk &= InstallOne("sdribble_end",      base, size, PAT_SDRIBBLE_END, (void*)&ct2_sdribble_end_hook,     6,  &g_ret_sdribble_end);
+    allOk &= InstallOne("sdribble_direct",   base, size, PAT_SDRIBBLE_DIR, (void*)&ct2_sdribble_direct_hook,  6,  &g_ret_sdribble_direct);
+    allOk &= InstallOne("sdribble_cooldown", base, size, PAT_SDRIBBLE_CD,  (void*)&ct2_sdribble_cooldown_hook,8,  &g_ret_sdribble_cooldown);
+    allOk &= InstallOne("ntcharge_tick",     base, size, PAT_NTCHARGE_TICK,(void*)&ct2_ntcharge_tick_hook,    8,  &g_ret_ntcharge_tick);
+    allOk &= InstallOne("ntcharge_release",  base, size, PAT_NTCHARGE_REL, (void*)&ct2_ntcharge_release_hook, 7,  &g_ret_ntcharge_release);
 
     // --- Unique Technique limit: resolve sites now, apply later on F6 ---
+    // (plain byte patch, no jmp involved, so no +-2GB concern here)
     uintptr_t ca = FindPattern(base, size, PAT_UQ_COUNT);
     uintptr_t cb = FindPattern(base, size, PAT_UQ_MAX);
     uintptr_t cc = FindPattern(base, size, PAT_UQ_SELECT);
@@ -276,11 +334,13 @@ static bool InstallHooks(uintptr_t base, size_t size) {
         g_uqSelect  = { cc + 2,  {2}, {4}, 1 };
         g_uqConfirm = { cd + 2,  {2}, {4}, 1 };
         g_uqResolved = true;
-        WriteLog("[+] unique-limit sites resolved (count=0x%llX max=0x%llX select=0x%llX confirm=0x%llX)",
-                 (unsigned long long)ca, (unsigned long long)cb, (unsigned long long)cc, (unsigned long long)cd);
+        WriteLog("[+] %-18s @ 0x%llX / 0x%llX / 0x%llX / 0x%llX",
+                 "unique_limit", (unsigned long long)ca, (unsigned long long)cb,
+                 (unsigned long long)cc, (unsigned long long)cd);
     } else {
         allOk = false;
-        WriteLog("[!] unique-limit AOBs not fully resolved");
+        WriteLog("[!] %-18s not fully resolved (count=%d max=%d select=%d confirm=%d)",
+                 "unique_limit", ca != 0, cb != 0, cc != 0, cd != 0);
     }
 
     return allOk;
@@ -346,7 +406,9 @@ static DWORD WINAPI MainThread(LPVOID) {
 
     bool installed = InstallHooks(base, size);
     Beep(installed ? 1200 : 400, 200);
-    WriteLog(installed ? "[i] All hooks installed." : "[!] Some hooks FAILED to install, see log above.");
+    WriteLog(installed
+        ? "[i] All hooks installed OK. Check lines above for any '[i] ... routed via near stub' - normal, not an error."
+        : "[!] One or more hooks FAILED - look for '[!]' lines above, that's exactly which cheat(s) won't work.");
 
     bool lastF1=false,lastF2=false,lastF3=false,lastF4=false,lastF5=false,lastF6=false,lastF9=false;
 
