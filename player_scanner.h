@@ -222,11 +222,12 @@ inline void ScanForPointer(uintptr_t target, std::vector<uintptr_t>& hits, size_
 }
 
 // After confirming the array's real base (the CharaID=1 record address),
-// find who points TO it. A hit that itself sits inside the game's main
-// module is gold: RVA = hit - moduleBase is stable across restarts, so
-// we can hardcode "read *(moduleBase+RVA) to get the live array base"
-// exactly like we already do for UGameSaveData. A hit sitting outside the
-// module (still on the heap) means one more hop is needed.
+// find who points TO it - and if that's still heap, keep hopping (pointer
+// to a pointer to a pointer...) until something lands inside the game's
+// main module. An in-module hit is gold: RVA = hit - moduleBase is stable
+// across restarts, so we can hardcode "read *(moduleBase+RVA)" to reach
+// the live array every session, exactly like we already do for
+// UGameSaveData. Capped depth/branching so one F7 press stays fast.
 inline void ScanForArrayPointer(uintptr_t arrayBase, FILE* out) {
     uintptr_t modBase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
     size_t modSize = 0;
@@ -236,22 +237,56 @@ inline void ScanForArrayPointer(uintptr_t arrayBase, FILE* out) {
         modSize = nt->OptionalHeader.SizeOfImage;
     }
 
-    std::vector<uintptr_t> hits;
-    ScanForPointer(arrayBase, hits, 2000);
+    static constexpr int kMaxDepth = 5;
+    static constexpr int kBranchPerLevel = 3; // how many hits per target we follow onward
+    static constexpr int kMaxFrontier = 6;    // total addresses carried into the next hop
 
-    fprintf(out, "\nPointer scan for array base 0x%llX: %zu hit(s)\n", (unsigned long long)arrayBase, hits.size());
-    int shown = 0;
-    for (uintptr_t h : hits) {
-        bool inModule = modBase && h >= modBase && h < modBase + modSize;
-        if (inModule) {
-            fprintf(out, "  0x%llX  -> INSIDE MODULE, RVA = 0x%llX  *** this is the stable one to use ***\n",
-                    (unsigned long long)h, (unsigned long long)(h - modBase));
-        } else {
-            fprintf(out, "  0x%llX  -> still heap, needs one more hop\n", (unsigned long long)h);
+    fprintf(out, "\nPointer chain hunt for array base 0x%llX (up to %d hops):\n",
+            (unsigned long long)arrayBase, kMaxDepth);
+
+    std::vector<uintptr_t> current = { arrayBase };
+    bool foundStable = false;
+
+    for (int depth = 1; depth <= kMaxDepth && !foundStable; ++depth) {
+        fprintf(out, " -- hop %d, following %zu address(es) --\n", depth, current.size());
+        std::vector<uintptr_t> next;
+
+        for (uintptr_t target : current) {
+            std::vector<uintptr_t> hits;
+            ScanForPointer(target, hits, 50000);
+            fprintf(out, "   0x%llX : %zu hit(s)", (unsigned long long)target, hits.size());
+            if (hits.empty()) { fprintf(out, "  (dead end)\n"); continue; }
+            fprintf(out, "\n");
+
+            int taken = 0;
+            for (uintptr_t h : hits) {
+                bool inModule = modBase && h >= modBase && h < modBase + modSize;
+                if (inModule) {
+                    fprintf(out, "      0x%llX  -> INSIDE MODULE, RVA = 0x%llX  *** STABLE, use this ***\n",
+                            (unsigned long long)h, (unsigned long long)(h - modBase));
+                    foundStable = true;
+                } else if (taken < kBranchPerLevel) {
+                    fprintf(out, "      0x%llX  -> heap, following further\n", (unsigned long long)h);
+                    next.push_back(h);
+                    ++taken;
+                }
+            }
+            if (hits.size() > static_cast<size_t>(taken) && !foundStable)
+                fprintf(out, "      (+%zu more hit(s) not followed, capped)\n", hits.size() - taken);
         }
-        if (++shown >= 50) { fprintf(out, "  ... %zu more, truncated\n", hits.size() - shown); break; }
+
+        if (foundStable) { fprintf(out, " -- stable anchor found at hop %d, stopping --\n", depth); break; }
+        if (next.empty()) { fprintf(out, " -- dead end, no more pointers at hop %d --\n", depth); break; }
+
+        std::sort(next.begin(), next.end());
+        next.erase(std::unique(next.begin(), next.end()), next.end());
+        if (next.size() > kMaxFrontier) next.resize(kMaxFrontier);
+        current = std::move(next);
     }
-    if (hits.empty()) fprintf(out, "  (nothing points directly at the array base - it may be reached via an offset into a bigger container; try again from a different screen, or widen the search)\n");
+
+    if (!foundStable)
+        fprintf(out, "\nNo in-module anchor found within %d hops. Try again from a different "
+                      "screen (one with the roster freshly loaded), or widen kBranchPerLevel.\n", kMaxDepth);
 }
 
 // F7: re-finds the best Izawa candidate fresh (addresses are heap-based,

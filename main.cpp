@@ -33,7 +33,7 @@ extern "C" {
 #include "move_inventory_unlocker.h"
 
 static constexpr const char* TRAINER_NAME = "CT2CheatDLL";
-static constexpr const char* TRAINER_VER  = "2.0";
+static constexpr const char* TRAINER_VER  = "2.2";
 
 static HMODULE g_hSelf = nullptr;
 
@@ -296,7 +296,7 @@ static DWORD WINAPI MainThread(LPVOID) {
     CustomPlayerEditor::WriteAllRefFiles();
     CustomPlayerEditor::WriteDefaultConfigIfMissing();
     WriteLog("[i] CustomPlayerEditor ready. Edit CT2_CustomPlayerMoves.txt (names from "
-             "CT2_MoveList_*.txt) - picked up automatically.");
+             "CT2_MoveList_Reference.txt) - picked up automatically.");
 
     WriteLog("[i] PlayerScanner ready. Press F8 on a roster/squad screen to hunt for the full "
              "player array - writes CT2_PlayerScan_Report.txt.");

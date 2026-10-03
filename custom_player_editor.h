@@ -212,34 +212,31 @@ inline Databases g_db;
 //  real move names to copy from, generated straight from the
 //  same embedded tables the lookup uses (always in sync).
 // ------------------------------------------------------------
-inline void WriteRefFile(const char* path, const MoveEntry* entries, int count) {
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "w") != 0 || !f) return;
+// Single consolidated reference file instead of 7 separate ones - same
+// content, far less clutter in the game folder.
+inline void WriteSection(FILE* f, const char* title, const MoveEntry* entries, int count) {
+    fprintf(f, "\n== %s (%d) ==\n", title, count);
     for (int i = 0; i < count; ++i) fprintf(f, "%s\n", entries[i].name);
-    fclose(f);
 }
 
-inline void WriteSuperRefFile(const char* path) {
+inline void WriteAllRefFiles() {
     FILE* f = nullptr;
-    if (fopen_s(&f, path, "w") != 0 || !f) return;
-    fprintf(f, "# Super Move catalog - name, catalog type, ID.\n");
-    fprintf(f, "# SuperType byte (0-8) is NOT yet confirmed to match these type\n");
-    fprintf(f, "# strings - see README for the calibration procedure.\n");
+    if (fopen_s(&f, "CT2_MoveList_Reference.txt", "w") != 0 || !f) return;
+    fprintf(f, "CT2 move name reference - copy exact names into CT2_CustomPlayerMoves.txt\n");
+    WriteSection(f, "Dribble", g_dribbleMoves, g_dribbleMoves_count);
+    WriteSection(f, "Tackle", g_tackleMoves, g_tackleMoves_count);
+    WriteSection(f, "Shot", g_shotMoves, g_shotMoves_count);
+    WriteSection(f, "AirShot", g_airshotMoves, g_airshotMoves_count);
+    WriteSection(f, "Saving", g_savingMoves, g_savingMoves_count);
+    WriteSection(f, "MiracleSaving", g_miracleMoves, g_miracleMoves_count);
+
+    fprintf(f, "\n== Super (%d) == name | catalog type | ID\n", g_superMoves_count);
+    fprintf(f, "# SuperType byte (0-8) not yet confirmed to match these type strings.\n");
     for (int i = 0; i < g_superMoves_count; ++i) {
         const auto& e = g_superMoves[i];
         fprintf(f, "%-32s | %-18s | ID %d\n", e.name, e.type, e.id);
     }
     fclose(f);
-}
-
-inline void WriteAllRefFiles() {
-    WriteRefFile("CT2_MoveList_Dribble.txt", g_dribbleMoves, g_dribbleMoves_count);
-    WriteRefFile("CT2_MoveList_Tackle.txt", g_tackleMoves, g_tackleMoves_count);
-    WriteRefFile("CT2_MoveList_Shot.txt", g_shotMoves, g_shotMoves_count);
-    WriteRefFile("CT2_MoveList_AirShot.txt", g_airshotMoves, g_airshotMoves_count);
-    WriteRefFile("CT2_MoveList_Saving.txt", g_savingMoves, g_savingMoves_count);
-    WriteRefFile("CT2_MoveList_MiracleSaving.txt", g_miracleMoves, g_miracleMoves_count);
-    WriteSuperRefFile("CT2_MoveList_Super.txt");
 }
 
 // ------------------------------------------------------------
