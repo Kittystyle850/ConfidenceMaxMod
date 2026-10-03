@@ -289,6 +289,11 @@ inline void ScanForArrayPointer(uintptr_t arrayBase, FILE* out) {
                       "screen (one with the roster freshly loaded), or widen kBranchPerLevel.\n", kMaxDepth);
 }
 
+// Exposed so F6 (write_trap.h) can arm a guard-page trap on whatever F7
+// most recently found, without the two modules needing to know much
+// about each other.
+inline uintptr_t g_lastFoundRecordAddr = 0;
+
 // F7: re-finds the best Izawa candidate fresh (addresses are heap-based,
 // they move every game restart), dumps the sequence around it, then
 // hunts for whoever points at the array's true base (CharaID=1 record).
@@ -315,6 +320,7 @@ inline void RunArrayDump() {
         return;
     }
     uintptr_t recordBase = best.primaryAddr + charaOffset;
+    g_lastFoundRecordAddr = recordBase;
 
     FILE* out = nullptr;
     fopen_s(&out, "CT2_ArrayDump_Report.txt", "w");
