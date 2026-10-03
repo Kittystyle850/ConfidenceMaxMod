@@ -1,0 +1,225 @@
+// ============================================================
+//  player_scanner.h  -  automated roster-array hunter
+//  ------------------------------------------------------------
+//  We don't know where the live "all 358 players" array lives in
+//  memory yet - nobody has reverse engineered it (not the CT table,
+//  not the save editor). Rather than you doing this by hand in
+//  Cheat Engine, this scans the whole process address space itself
+//  for known "fingerprint" players (CharaID + their exact equipped
+//  moveset, pulled from the save editor's own verified database)
+//  and reports every spot where several of those values turn up
+//  close together - that clustering is what a real struct record
+//  looks like, as opposed to coincidental noise.
+//
+//  Triggered by F8. Writes CT2_PlayerScan_Report.txt. Safe to run
+//  while playing - runs on our own background thread, not the
+//  game's render thread, so at worst it causes a brief stutter.
+// ============================================================
+#pragma once
+#include <windows.h>
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+#include <functional>
+#include <algorithm>
+
+extern void WriteLog(const char* fmt, ...);
+
+namespace PlayerScanner {
+
+// ------------------------------------------------------------
+//  Known players, straight from the save editor's database.
+//  "primary" is the field we scan for first - pick a value that's
+//  rare enough to keep the initial hit count manageable (not 0-20,
+//  which collide with timers/counters/UI state everywhere).
+// ------------------------------------------------------------
+struct Fingerprint {
+    const char* label;
+    int32_t charaId;
+    int32_t tackle, dribble, shot, airshot, superId;
+    int32_t primary; // which of the above to scan for first
+};
+
+static const Fingerprint g_fingerprints[] = {
+    { "Izawa",  16, 913, 903, 910, 1304, 902, 1304 },
+    { "Sawada", 17, 905, 304, 318, 1906, 305,  304 },
+    { "Hyuga",   2, 908,   2,   1, 1905,   3, 1905 },
+};
+static constexpr int kFingerprintCount = sizeof(g_fingerprints) / sizeof(g_fingerprints[0]);
+
+static constexpr int   kWindowBytes   = 0x80;   // search +/- this many bytes around each primary hit
+static constexpr size_t kMaxHitsPerPrimary = 500000; // safety cap, a real roster won't trigger this
+
+// ------------------------------------------------------------
+//  Walk every committed, readable region of our own process.
+// ------------------------------------------------------------
+inline void ForEachRegion(const std::function<void(uint8_t*, size_t)>& visit) {
+    uint8_t* addr = nullptr;
+    MEMORY_BASIC_INFORMATION mbi{};
+    for (;;) {
+        if (VirtualQuery(addr, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
+        bool readable = mbi.State == MEM_COMMIT &&
+            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READ | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) != 0 &&
+            (mbi.Protect & PAGE_GUARD) == 0 && (mbi.Protect & PAGE_NOACCESS) == 0;
+        if (readable && mbi.RegionSize > 0) visit(reinterpret_cast<uint8_t*>(mbi.BaseAddress), mbi.RegionSize);
+        uint8_t* next = reinterpret_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (next <= addr) break; // overflow / no progress guard
+        addr = next;
+    }
+}
+
+// Scanning in-process means a direct pointer deref, not a safe
+// ReadProcessMemory from outside - if the game frees/decommits a
+// page between VirtualQuery and our read (very possible, the engine
+// is allocating/freeing constantly), a naive scan can crash the
+// game. Wrap each region in SEH so a bad page just gets skipped.
+inline void ScanRegionSafe(uint8_t* base, size_t size, int32_t target,
+                            std::vector<uintptr_t>& hits, size_t maxHits) {
+    size_t count = size / 4;
+    int32_t* p = reinterpret_cast<int32_t*>(base);
+#if defined(_MSC_VER)
+    __try {
+        for (size_t i = 0; i < count; ++i) {
+            if (hits.size() >= maxHits) return;
+            if (p[i] == target) hits.push_back(reinterpret_cast<uintptr_t>(&p[i]));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // region went bad mid-scan - skip it, not fatal
+    }
+#else
+    for (size_t i = 0; i < count; ++i) {
+        if (hits.size() >= maxHits) return;
+        if (p[i] == target) hits.push_back(reinterpret_cast<uintptr_t>(&p[i]));
+    }
+#endif
+}
+
+inline void ScanForInt32(int32_t target, std::vector<uintptr_t>& hits) {
+    ForEachRegion([&](uint8_t* base, size_t size) {
+        if (hits.size() >= kMaxHitsPerPrimary) return;
+        ScanRegionSafe(base, size, target, hits, kMaxHitsPerPrimary);
+    });
+}
+
+inline bool SafeReadI32(uintptr_t addr, int32_t& out) {
+    if (IsBadReadPtr(reinterpret_cast<void*>(addr), 4)) return false;
+    out = *reinterpret_cast<volatile int32_t*>(addr);
+    return true;
+}
+
+struct Candidate {
+    uintptr_t primaryAddr;
+    int       score; // how many companion fields were found nearby
+    int32_t   foundOffsets[8];
+    const char* foundNames[8];
+    int       foundCount;
+};
+
+// Scans one fingerprint: finds every occurrence of its "primary"
+// value, then checks a window around each hit for the OTHER known
+// field values (at any 4-byte-aligned offset, since we don't yet
+// know the real struct layout - that's exactly what we're after).
+inline std::vector<Candidate> ScanFingerprint(const Fingerprint& fp, FILE* rawLog) {
+    std::vector<uintptr_t> hits;
+    ScanForInt32(fp.primary, hits);
+    if (rawLog) fprintf(rawLog, "[%s] primary value %d: %zu raw hits\n", fp.label, fp.primary, hits.size());
+
+    struct Field { int32_t value; const char* name; };
+    Field fields[] = {
+        {fp.charaId, "CharaID"}, {fp.tackle, "Tackle"}, {fp.dribble, "Dribble"},
+        {fp.shot, "Shot"}, {fp.airshot, "AirShot"}, {fp.superId, "SuperID"},
+    };
+
+    std::vector<Candidate> candidates;
+    for (uintptr_t h : hits) {
+        Candidate c{};
+        c.primaryAddr = h;
+        c.score = 0;
+        c.foundCount = 0;
+        for (int off = -kWindowBytes; off <= kWindowBytes; off += 4) {
+            if (off == 0) continue; // that's the primary field itself
+            int32_t v = 0;
+            if (!SafeReadI32(h + off, v)) continue;
+            for (auto& f : fields) {
+                if (v == f.value && c.foundCount < 8) {
+                    c.foundOffsets[c.foundCount] = off;
+                    c.foundNames[c.foundCount] = f.name;
+                    ++c.foundCount;
+                    ++c.score;
+                    break;
+                }
+            }
+        }
+        if (c.score >= 2) candidates.push_back(c); // primary + at least 2 companions nearby
+    }
+    return candidates;
+}
+
+inline void DumpAround(FILE* f, uintptr_t addr) {
+    fprintf(f, "    dump %+d..%+d (int32, little-endian):\n", -kWindowBytes, kWindowBytes);
+    for (int off = -kWindowBytes; off <= kWindowBytes; off += 16) {
+        fprintf(f, "    %+5d:", off);
+        for (int sub = 0; sub < 16 && off + sub <= kWindowBytes; sub += 4) {
+            int32_t v = 0;
+            if (SafeReadI32(addr + off + sub, v)) fprintf(f, " %10d", v);
+            else fprintf(f, "       ----");
+        }
+        fprintf(f, "\n");
+    }
+}
+
+inline void RunScanAndReport() {
+    WriteLog("[i] PlayerScanner: F8 pressed, scanning process memory (may take a few seconds)...");
+    DWORD t0 = GetTickCount();
+
+    FILE* report = nullptr;
+    fopen_s(&report, "CT2_PlayerScan_Report.txt", "w");
+    FILE* raw = nullptr;
+    fopen_s(&raw, "CT2_PlayerScan_Raw.txt", "w");
+
+    if (!report) { WriteLog("[!] PlayerScanner: could not open report file"); return; }
+
+    fprintf(report, "CT2 Player Scanner report\n");
+    fprintf(report, "==========================\n");
+    fprintf(report, "Window around each primary hit: +/- 0x%X bytes. Score = how many OTHER\n", kWindowBytes);
+    fprintf(report, "known fields from the same fingerprint were found nearby (higher = more\n");
+    fprintf(report, "likely a real struct record, not coincidence).\n\n");
+
+    int totalCandidates = 0;
+    for (int i = 0; i < kFingerprintCount; ++i) {
+        const auto& fp = g_fingerprints[i];
+        auto candidates = ScanFingerprint(fp, raw);
+        // best candidates first
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+            return a.score > b.score;
+        });
+
+        fprintf(report, "---- %s (CharaID %d) ---- %zu candidate(s) with score>=2\n",
+                fp.label, fp.charaId, candidates.size());
+
+        int shown = 0;
+        for (const auto& c : candidates) {
+            if (shown >= 15) { fprintf(report, "  ... %zu more, see pattern above\n", candidates.size() - shown); break; }
+            fprintf(report, "  primary(%s=%d) @ 0x%llX  score=%d\n",
+                    "value", fp.primary, (unsigned long long)c.primaryAddr, c.score);
+            for (int j = 0; j < c.foundCount; ++j) {
+                fprintf(report, "      %-8s found at offset %+d\n", c.foundNames[j], c.foundOffsets[j]);
+            }
+            DumpAround(report, c.primaryAddr);
+            fprintf(report, "\n");
+            ++shown;
+            ++totalCandidates;
+        }
+        fprintf(report, "\n");
+    }
+
+    DWORD elapsed = GetTickCount() - t0;
+    fprintf(report, "Scan finished in %lu ms. Total high-confidence candidates: %d\n", elapsed, totalCandidates);
+    fclose(report);
+    if (raw) fclose(raw);
+
+    WriteLog("[+] PlayerScanner: done in %lu ms, %d candidate(s) written to CT2_PlayerScan_Report.txt",
+             elapsed, totalCandidates);
+}
+
+} // namespace PlayerScanner

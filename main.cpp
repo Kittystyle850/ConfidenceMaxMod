@@ -17,12 +17,19 @@
 #include <ctime>
 #include <vector>
 
+// ---- forward decl needed by custom_player_editor.h before WriteLog's
+//      definition further down (non-static: the header calls it too) ----
+void WriteLog(const char* fmt, ...);
+
 // ---- symbols defined in hooks.asm ----
 extern "C" {
     extern uint8_t  g_flag_chain;          // defaults to 1 (ON) in hooks.asm
     extern uint64_t g_ret_chain_level_set;
     void ct2_chain_level_set_hook();
 }
+
+#include "custom_player_editor.h"
+#include "player_scanner.h"
 
 static constexpr const char* TRAINER_NAME = "CT2CheatDLL";
 static constexpr const char* TRAINER_VER  = "2.0";
@@ -32,7 +39,7 @@ static HMODULE g_hSelf = nullptr;
 // ============================================================
 //  Log
 // ============================================================
-static void WriteLog(const char* fmt, ...) {
+void WriteLog(const char* fmt, ...) {
     FILE* f = nullptr;
     if (fopen_s(&f, "CT2CheatDLL_log.txt", "a") != 0 || !f) return;
     std::time_t t = std::time(nullptr);
@@ -281,12 +288,45 @@ static DWORD WINAPI MainThread(LPVOID) {
         ? "[i] CHAIN MAX + Unique Technique Limit=4 both active. No hotkeys, no sound."
         : "[!] Something FAILED - look for '[!]' lines above.");
 
+    // Custom Player live editor: embedded move-name databases, reference
+    // lists, default config file, and a watcher that re-applies the
+    // config whenever its content actually changes.
+    CustomPlayerEditor::g_db.BuildAll();
+    CustomPlayerEditor::WriteAllRefFiles();
+    CustomPlayerEditor::WriteDefaultConfigIfMissing();
+    WriteLog("[i] CustomPlayerEditor ready. Edit CT2_CustomPlayerMoves.txt (names from "
+             "CT2_MoveList_*.txt) - picked up automatically.");
+
+    WriteLog("[i] PlayerScanner ready. Press F8 on a roster/squad screen to hunt for the full "
+             "player array - writes CT2_PlayerScan_Report.txt.");
+
+    FILETIME lastWrite{};
     bool lastF9 = false;
+    bool lastF8 = false;
+    int pollTick = 0;
     while (true) {
         if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) { WriteLog("[i] ESC, stopping watch loop."); break; }
         bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
         if (f9 && !lastF9) { WriteLog("[i] F9, unloading DLL."); FreeLibraryAndExitThread(g_hSelf, 0); }
         lastF9 = f9;
+
+        bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+        if (f8 && !lastF8) PlayerScanner::RunScanAndReport();
+        lastF8 = f8;
+
+        // Check the config file's mtime roughly twice a second; only
+        // re-apply when it actually changed, so the log doesn't spam.
+        if (++pollTick >= 15) {
+            pollTick = 0;
+            WIN32_FILE_ATTRIBUTE_DATA fad{};
+            if (GetFileAttributesExA(CustomPlayerEditor::CONFIG_PATH, GetFileExInfoStandard, &fad)) {
+                if (CompareFileTime(&fad.ftLastWriteTime, &lastWrite) != 0) {
+                    lastWrite = fad.ftLastWriteTime;
+                    CustomPlayerEditor::ApplyConfig();
+                }
+            }
+        }
+
         Sleep(30);
     }
 
