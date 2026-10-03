@@ -30,6 +30,7 @@ extern "C" {
 
 #include "custom_player_editor.h"
 #include "player_scanner.h"
+#include "move_inventory_unlocker.h"
 
 static constexpr const char* TRAINER_NAME = "CT2CheatDLL";
 static constexpr const char* TRAINER_VER  = "2.0";
@@ -305,6 +306,8 @@ static DWORD WINAPI MainThread(LPVOID) {
     bool lastF8 = false;
     bool lastF7 = false;
     int pollTick = 0;
+    bool unlockDone = false;
+    int unlockAttempts = 0;
     while (true) {
         if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) { WriteLog("[i] ESC, stopping watch loop."); break; }
         bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
@@ -318,6 +321,27 @@ static DWORD WINAPI MainThread(LPVOID) {
         bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
         if (f7 && !lastF7) PlayerScanner::RunArrayDump();
         lastF7 = f7;
+
+        // Unlock-all-move-cards: try once the save pointer resolves, give
+        // up after ~20s of retries (covers "DLL injected before menu is
+        // ready") so we don't spam the log forever if something's off.
+        if (!unlockDone && unlockAttempts < 40) {
+            if ((pollTick % 15) == 0) { // roughly twice a second, same cadence as config polling
+                auto chain = CustomPlayerEditor::Resolve();
+                if (chain.ok) {
+                    ++unlockAttempts;
+                    auto res = MoveInventoryUnlocker::UnlockAll(chain.save);
+                    if (res.ok) {
+                        unlockDone = true;
+                        WriteLog("[+] MoveInventoryUnlocker: unlocked %d/%d move cards (%d mv_, %d smv_, %d already owned)",
+                                 res.newlyUnlocked, res.totalKeys, res.normalKeys, res.superKeys, res.alreadyOwned);
+                    } else if (unlockAttempts >= 40) {
+                        WriteLog("[!] MoveInventoryUnlocker: giving up after %d tries - %s",
+                                 unlockAttempts, res.failReason ? res.failReason : "unknown reason");
+                    }
+                }
+            }
+        }
 
         // Check the config file's mtime roughly twice a second; only
         // re-apply when it actually changed, so the log doesn't spam.
