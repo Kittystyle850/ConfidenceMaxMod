@@ -303,6 +303,7 @@ static DWORD WINAPI MainThread(LPVOID) {
     FILETIME lastWrite{};
     bool lastF9 = false;
     bool lastF8 = false;
+    bool lastF7 = false;
     int pollTick = 0;
     while (true) {
         if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) { WriteLog("[i] ESC, stopping watch loop."); break; }
@@ -313,6 +314,10 @@ static DWORD WINAPI MainThread(LPVOID) {
         bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
         if (f8 && !lastF8) PlayerScanner::RunScanAndReport();
         lastF8 = f8;
+
+        bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+        if (f7 && !lastF7) PlayerScanner::RunArrayDump();
+        lastF7 = f7;
 
         // Check the config file's mtime roughly twice a second; only
         // re-apply when it actually changed, so the log doesn't spam.

@@ -168,6 +168,76 @@ inline void DumpAround(FILE* f, uintptr_t addr) {
     }
 }
 
+// ------------------------------------------------------------
+//  Array dump: given the already-confirmed Izawa anchor, walk
+//  `stride` bytes at a time both directions and print each record's
+//  CharaID (resolved to a real name) plus its next 7 raw int32
+//  fields. Lets us read the field order/stride off in plain text
+//  across many consecutive players at once, instead of guessing
+//  from one isolated pair.
+// ------------------------------------------------------------
+inline const char* LookupPlayerName(int32_t charaId) {
+    for (int i = 0; i < g_playerNames_count; ++i)
+        if (g_playerNames[i].chara_id == charaId) return g_playerNames[i].name;
+    return nullptr;
+}
+
+static constexpr size_t kAssumedStride = 0x28; // confirmed from the F8 report (Izawa -> Sawada gap)
+
+inline void DumpArraySequence(uintptr_t recordBase, int before, int after, FILE* out) {
+    for (int i = -before; i <= after; ++i) {
+        uintptr_t rec = recordBase + static_cast<intptr_t>(i) * static_cast<intptr_t>(kAssumedStride);
+        int32_t charaId = 0;
+        if (!SafeReadI32(rec, charaId)) { fprintf(out, "[%+3d] 0x%llX  (unreadable)\n", i, (unsigned long long)rec); continue; }
+        const char* name = LookupPlayerName(charaId);
+        fprintf(out, "[%+3d] 0x%llX  CharaID=%-6d %-22s", i, (unsigned long long)rec, charaId, name ? name : "? (unknown id)");
+        for (int off = 4; off <= 28; off += 4) {
+            int32_t v = 0;
+            if (SafeReadI32(rec + off, v)) fprintf(out, "+%02d:%-7d", off, v);
+        }
+        fprintf(out, "\n");
+    }
+}
+
+// F7: re-finds the best Izawa candidate fresh (addresses are heap-based,
+// they move every game restart) and dumps the sequence around it.
+inline void RunArrayDump() {
+    WriteLog("[i] PlayerScanner: F7 pressed, re-locating Izawa anchor then dumping array...");
+    const Fingerprint& izawa = g_fingerprints[0]; // must stay "Izawa" at index 0
+
+    FILE* raw = nullptr; // ScanFingerprint wants a log, we don't need it here
+    auto candidates = ScanFingerprint(izawa, raw);
+    if (candidates.empty()) {
+        WriteLog("[!] PlayerScanner: no Izawa candidate found - are you on the right screen?");
+        return;
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
+    const Candidate& best = candidates[0];
+
+    // Find where CharaID landed among this candidate's companion matches.
+    int charaOffset = INT32_MIN;
+    for (int j = 0; j < best.foundCount; ++j) {
+        if (strcmp(best.foundNames[j], "CharaID") == 0) { charaOffset = best.foundOffsets[j]; break; }
+    }
+    if (charaOffset == INT32_MIN) {
+        WriteLog("[!] PlayerScanner: best candidate (score %d) has no CharaID match, can't anchor the dump", best.score);
+        return;
+    }
+    uintptr_t recordBase = best.primaryAddr + charaOffset;
+
+    FILE* out = nullptr;
+    fopen_s(&out, "CT2_ArrayDump_Report.txt", "w");
+    if (!out) { WriteLog("[!] PlayerScanner: could not open dump report file"); return; }
+    fprintf(out, "Array dump around Izawa (score %d), record_base=0x%llX, assumed stride=0x%zX\n",
+            best.score, (unsigned long long)recordBase, kAssumedStride);
+    fprintf(out, "Columns after the name are raw int32 at +04..+28 relative to each record's start.\n\n");
+    DumpArraySequence(recordBase, 15, 60, out);
+    fclose(out);
+
+    WriteLog("[+] PlayerScanner: array dump written to CT2_ArrayDump_Report.txt (base=0x%llX)",
+             (unsigned long long)recordBase);
+}
+
 inline void RunScanAndReport() {
     WriteLog("[i] PlayerScanner: F8 pressed, scanning process memory (may take a few seconds)...");
     DWORD t0 = GetTickCount();
