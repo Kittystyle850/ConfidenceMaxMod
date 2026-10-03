@@ -199,8 +199,64 @@ inline void DumpArraySequence(uintptr_t recordBase, int before, int after, FILE*
     }
 }
 
+inline void ScanForPointer(uintptr_t target, std::vector<uintptr_t>& hits, size_t maxHits) {
+    ForEachRegion([&](uint8_t* base, size_t size) {
+        if (hits.size() >= maxHits) return;
+        size_t count = size / 8;
+        uint64_t* p = reinterpret_cast<uint64_t*>(base);
+#if defined(_MSC_VER)
+        __try {
+            for (size_t i = 0; i < count; ++i) {
+                if (hits.size() >= maxHits) return;
+                if (p[i] == target) hits.push_back(reinterpret_cast<uintptr_t>(&p[i]));
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+#else
+        for (size_t i = 0; i < count; ++i) {
+            if (hits.size() >= maxHits) return;
+            if (p[i] == target) hits.push_back(reinterpret_cast<uintptr_t>(&p[i]));
+        }
+#endif
+    });
+}
+
+// After confirming the array's real base (the CharaID=1 record address),
+// find who points TO it. A hit that itself sits inside the game's main
+// module is gold: RVA = hit - moduleBase is stable across restarts, so
+// we can hardcode "read *(moduleBase+RVA) to get the live array base"
+// exactly like we already do for UGameSaveData. A hit sitting outside the
+// module (still on the heap) means one more hop is needed.
+inline void ScanForArrayPointer(uintptr_t arrayBase, FILE* out) {
+    uintptr_t modBase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    size_t modSize = 0;
+    if (modBase) {
+        auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(modBase);
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(modBase + dos->e_lfanew);
+        modSize = nt->OptionalHeader.SizeOfImage;
+    }
+
+    std::vector<uintptr_t> hits;
+    ScanForPointer(arrayBase, hits, 2000);
+
+    fprintf(out, "\nPointer scan for array base 0x%llX: %zu hit(s)\n", (unsigned long long)arrayBase, hits.size());
+    int shown = 0;
+    for (uintptr_t h : hits) {
+        bool inModule = modBase && h >= modBase && h < modBase + modSize;
+        if (inModule) {
+            fprintf(out, "  0x%llX  -> INSIDE MODULE, RVA = 0x%llX  *** this is the stable one to use ***\n",
+                    (unsigned long long)h, (unsigned long long)(h - modBase));
+        } else {
+            fprintf(out, "  0x%llX  -> still heap, needs one more hop\n", (unsigned long long)h);
+        }
+        if (++shown >= 50) { fprintf(out, "  ... %zu more, truncated\n", hits.size() - shown); break; }
+    }
+    if (hits.empty()) fprintf(out, "  (nothing points directly at the array base - it may be reached via an offset into a bigger container; try again from a different screen, or widen the search)\n");
+}
+
 // F7: re-finds the best Izawa candidate fresh (addresses are heap-based,
-// they move every game restart) and dumps the sequence around it.
+// they move every game restart), dumps the sequence around it, then
+// hunts for whoever points at the array's true base (CharaID=1 record).
 inline void RunArrayDump() {
     WriteLog("[i] PlayerScanner: F7 pressed, re-locating Izawa anchor then dumping array...");
     const Fingerprint& izawa = g_fingerprints[0]; // must stay "Izawa" at index 0
@@ -232,9 +288,20 @@ inline void RunArrayDump() {
             best.score, (unsigned long long)recordBase, kAssumedStride);
     fprintf(out, "Columns after the name are raw int32 at +04..+28 relative to each record's start.\n\n");
     DumpArraySequence(recordBase, 15, 60, out);
-    fclose(out);
 
-    WriteLog("[+] PlayerScanner: array dump written to CT2_ArrayDump_Report.txt (base=0x%llX)",
+    // CharaID=1 should be the true array base if CharaIDs start at 1 with
+    // no gaps (true for every session so far) - walk back from Izawa (16).
+    uintptr_t arrayBase = recordBase - static_cast<uintptr_t>(15) * kAssumedStride;
+    int32_t firstId = 0;
+    if (SafeReadI32(arrayBase, firstId) && firstId == 1) {
+        ScanForArrayPointer(arrayBase, out);
+    } else {
+        fprintf(out, "\n[!] record_base - 15*stride didn't land on CharaID=1 (got %d) - "
+                      "skipping pointer scan, the array may not start where expected.\n", firstId);
+    }
+
+    fclose(out);
+    WriteLog("[+] PlayerScanner: array dump + pointer scan written to CT2_ArrayDump_Report.txt (base=0x%llX)",
              (unsigned long long)recordBase);
 }
 
