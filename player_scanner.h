@@ -22,6 +22,7 @@
 #include <vector>
 #include <functional>
 #include <algorithm>
+#include <cstring>
 #include "player_names.h"
 
 extern void WriteLog(const char* fmt, ...);
@@ -294,6 +295,20 @@ inline void ScanForArrayPointer(uintptr_t arrayBase, FILE* out) {
 // most recently found, without the two modules needing to know much
 // about each other.
 inline uintptr_t g_lastFoundRecordAddr = 0;
+
+// Lightweight version of the F7 anchor search, with no file output - used
+// by the automatic background loop to re-locate Izawa every few seconds
+// so the write trap can be retargeted without any keypress.
+inline uintptr_t FindBestIzawaAnchor() {
+    const Fingerprint& izawa = g_fingerprints[0];
+    auto candidates = ScanFingerprint(izawa, nullptr);
+    if (candidates.empty()) return 0;
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
+    const Candidate& best = candidates[0];
+    for (int j = 0; j < best.foundCount; ++j)
+        if (strcmp(best.foundNames[j], "CharaID") == 0) return best.primaryAddr + best.foundOffsets[j];
+    return 0;
+}
 
 // F7: re-finds the best Izawa candidate fresh (addresses are heap-based,
 // they move every game restart), dumps the sequence around it, then

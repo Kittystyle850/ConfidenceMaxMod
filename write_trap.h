@@ -37,8 +37,8 @@ inline std::vector<SeenRip> g_seenRips;
 inline int   g_totalHits = 0;
 inline DWORD g_armStartTick = 0;
 
-static constexpr int   kMaxDistinctRips = 25;
-static constexpr DWORD kAutoDisarmMs = 90000; // 90s safety cap
+static constexpr int kMaxDistinctRips = 40; // accumulates for the WHOLE session now, not per-arm
+inline bool g_finished = false;
 
 inline void DumpCodeAround(FILE* f, uintptr_t rip) {
     fprintf(f, "  code bytes RIP-32..RIP+32:\n   ");
@@ -104,24 +104,22 @@ inline LONG CALLBACK GuardPageHandler(EXCEPTION_POINTERS* ep) {
                  g_seenRips.size(), (unsigned long long)rip, g_totalHits);
     }
 
-    bool timeUp = (GetTickCount() - g_armStartTick) > kAutoDisarmMs;
-    bool full = static_cast<int>(g_seenRips.size()) >= kMaxDistinctRips;
-    if (timeUp || full) {
+    if (static_cast<int>(g_seenRips.size()) >= kMaxDistinctRips) {
         g_armed = false;
+        g_finished = true;
         FILE* f = nullptr;
         fopen_s(&f, "CT2_WriteTrap_Report.txt", "a");
         if (f) {
-            fprintf(f, "=== watch finished (%s): %d total hits, %zu distinct RIPs ===\n\n",
-                    full ? "distinct-RIP cap reached" : "time cap reached", g_totalHits, g_seenRips.size());
+            fprintf(f, "=== watch finished (distinct-RIP cap reached): %d total hits, %zu distinct RIPs ===\n\n",
+                    g_totalHits, g_seenRips.size());
             fclose(f);
         }
-        WriteLog("[i] WriteTrap: finished watching (%s) - %d total hits, %zu distinct RIPs, see CT2_WriteTrap_Report.txt",
-                 full ? "cap reached" : "90s elapsed", g_totalHits, g_seenRips.size());
-        // leave the page in its normal (non-guarded) state
-        return EXCEPTION_CONTINUE_EXECUTION;
+        WriteLog("[i] WriteTrap: finished (cap reached) - %d total hits, %zu distinct RIPs, see CT2_WriteTrap_Report.txt",
+                 g_totalHits, g_seenRips.size());
+        return EXCEPTION_CONTINUE_EXECUTION; // leave the page unguarded
     }
 
-    Rearm(); // keep watching
+    Rearm(); // keep watching the same page
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
@@ -129,21 +127,13 @@ inline void EnsureHandlerInstalled() {
     if (!g_vehHandle) g_vehHandle = AddVectoredExceptionHandler(1, GuardPageHandler);
 }
 
-// Starts (or restarts) a watch session on the page containing `addr`.
-// Keeps re-arming itself after every hit until it's seen kMaxDistinctRips
-// different instructions or kAutoDisarmMs has passed - no need to press
-// F6 again after every navigation, just keep playing and check the
-// report file afterward.
-inline bool Arm(uintptr_t addr) {
+inline bool ArmInternal(uintptr_t addr, bool verbose) {
     EnsureHandlerInstalled();
     SYSTEM_INFO si{};
     GetSystemInfo(&si);
     g_pageSize = si.dwPageSize ? si.dwPageSize : 0x1000;
     g_watchAddr = addr;
     g_watchPageBase = addr & ~(static_cast<uintptr_t>(g_pageSize) - 1);
-    g_seenRips.clear();
-    g_totalHits = 0;
-    g_armStartTick = GetTickCount();
 
     if (!Rearm()) {
         WriteLog("[!] WriteTrap: VirtualProtect failed on 0x%llX (err=%lu)",
@@ -151,10 +141,33 @@ inline bool Arm(uintptr_t addr) {
         return false;
     }
     g_armed = true;
-    WriteLog("[i] WriteTrap: watching 0x%llX, self-rearming for up to %d distinct hits / %lu s "
-              "- just keep navigating in-game, no need to press F6 again.",
-              (unsigned long long)addr, kMaxDistinctRips, kAutoDisarmMs / 1000);
+    if (verbose) {
+        WriteLog("[i] WriteTrap: watching 0x%llX, self-rearming up to %d distinct instructions "
+                  "(accumulates for the whole session).", (unsigned long long)addr, kMaxDistinctRips);
+    }
     return true;
+}
+
+// Starts a watch session on the page containing `addr`, clearing any
+// accumulated findings first - only used by the manual F6 hotkey, for
+// an explicit "start fresh" request.
+inline bool ArmFresh(uintptr_t addr) {
+    g_seenRips.clear();
+    g_totalHits = 0;
+    g_finished = false;
+    g_armStartTick = GetTickCount();
+    return ArmInternal(addr, true);
+}
+
+// Re-points the watch at a new address WITHOUT clearing anything already
+// collected - this is what the automatic background loop uses, since the
+// array keeps getting reallocated at a different address every time the
+// roster screen is touched, but we still want one cumulative report.
+inline bool RetargetKeepHistory(uintptr_t addr) {
+    if (g_finished) return false; // already hit the cap, stop bothering it
+    bool first = (g_armStartTick == 0);
+    if (first) g_armStartTick = GetTickCount();
+    return ArmInternal(addr, false);
 }
 
 } // namespace WriteTrap

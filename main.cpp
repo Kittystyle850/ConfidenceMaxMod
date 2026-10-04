@@ -72,12 +72,15 @@ static DWORD WINAPI MainThread(LPVOID) {
     uintptr_t base = SavePointer::ModuleBase();
     WriteLog("[i] %s v%s started. base=0x%llX", TRAINER_NAME, TRAINER_VER, (unsigned long long)base);
     WriteLog("[i] No gameplay hooks installed yet - this build is for finding the real one. "
-             "F8=fingerprint scan, F7=array dump+pointer chase, F6=write trap, F9=unload.");
+             "Fully automatic: just play normally (change players, open move menus) and the "
+             "write trap finds and tracks itself every ~10s. F6=force a fresh restart of the "
+             "watch, F7/F8=manual diagnostics, F9=unload.");
 
     bool unlockDone = false;
     int unlockAttempts = 0;
     bool lastF9 = false, lastF8 = false, lastF7 = false, lastF6 = false;
     int pollTick = 0;
+    uintptr_t lastAutoAnchor = 0;
 
     while (true) {
         if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) { WriteLog("[i] ESC, stopping watcher thread."); break; }
@@ -96,10 +99,25 @@ static DWORD WINAPI MainThread(LPVOID) {
 
         bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
         if (f6 && !lastF6) {
-            if (PlayerScanner::g_lastFoundRecordAddr) WriteTrap::Arm(PlayerScanner::g_lastFoundRecordAddr);
-            else WriteLog("[!] WriteTrap: press F7 first so there's something to watch.");
+            // manual override: start a FRESH watch (clears anything collected so far)
+            if (PlayerScanner::g_lastFoundRecordAddr) WriteTrap::ArmFresh(PlayerScanner::g_lastFoundRecordAddr);
+            else WriteLog("[!] WriteTrap: no anchor found yet, wait for the automatic scan or press F7 first.");
         }
         lastF6 = f6;
+
+        // Fully automatic: every ~10s, re-find Izawa and retarget the
+        // write trap at wherever he currently is - no keypress needed.
+        // Findings accumulate for the whole session (RetargetKeepHistory
+        // never clears what's already been collected).
+        if (!WriteTrap::g_finished && (pollTick % 300) == 0) { // ~10s at 30ms/tick
+            uintptr_t anchor = PlayerScanner::FindBestIzawaAnchor();
+            if (anchor && anchor != lastAutoAnchor) {
+                lastAutoAnchor = anchor;
+                PlayerScanner::g_lastFoundRecordAddr = anchor;
+                WriteTrap::RetargetKeepHistory(anchor);
+                WriteLog("[i] Auto-scan: retargeted write trap @ 0x%llX", (unsigned long long)anchor);
+            }
+        }
 
         // Prerequisite confirmed necessary (though not sufficient alone):
         // make sure every mv_/smv_ move card is owned. Tries for ~20s
