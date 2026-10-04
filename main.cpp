@@ -39,7 +39,36 @@ void WriteLog(const char* fmt, ...);
 #include "write_trap.h"
 
 static constexpr const char* TRAINER_NAME = "CT2 AllMoves (research build)";
-static constexpr const char* TRAINER_VER  = "0.3";
+static constexpr const char* TRAINER_VER  = "0.4";
+
+// Confirmed stable from the first WriteTrap capture: a record-copy
+// routine (0x28-byte struct, matches our confirmed layout exactly)
+// living at this fixed RVA. Dumped wide and unconditionally at startup
+// now - no need to catch it via the trap again, it's not heap-based.
+static constexpr uintptr_t RVA_RECORD_COPY_FN = 0x48E3870;
+
+static void DumpInterestingFunction(uintptr_t base) {
+    if (!base) return;
+    uintptr_t addr = base + RVA_RECORD_COPY_FN;
+    FILE* f = nullptr;
+    if (fopen_s(&f, "CT2_InterestingFunction_Dump.txt", "w") != 0 || !f) return;
+    fprintf(f, "Record-copy routine, module RVA 0x%llX (confirmed stable, caught via WriteTrap)\n",
+            (unsigned long long)RVA_RECORD_COPY_FN);
+    fprintf(f, "16 bytes per row, <HERE> marks the exact instruction the trap caught.\n\n");
+    static constexpr int kWindow = 256;
+    for (int rowStart = -kWindow; rowStart <= kWindow; rowStart += 16) {
+        fprintf(f, "%+5d: ", rowStart);
+        for (int i = 0; i < 16 && rowStart + i <= kWindow; ++i) {
+            int off = rowStart + i;
+            uint8_t b = 0;
+            uintptr_t p = addr + off;
+            if (!IsBadReadPtr(reinterpret_cast<void*>(p), 1)) b = *reinterpret_cast<volatile uint8_t*>(p);
+            fprintf(f, "%02X%s", b, off == 0 ? "*" : " ");
+        }
+        fprintf(f, "\n");
+    }
+    fclose(f);
+}
 
 static HMODULE g_hSelf = nullptr;
 
@@ -71,6 +100,9 @@ void WriteLog(const char* fmt, ...) {
 static DWORD WINAPI MainThread(LPVOID) {
     uintptr_t base = SavePointer::ModuleBase();
     WriteLog("[i] %s v%s started. base=0x%llX", TRAINER_NAME, TRAINER_VER, (unsigned long long)base);
+    DumpInterestingFunction(base);
+    WriteLog("[i] Dumped the record-copy routine (RVA 0x%llX) to CT2_InterestingFunction_Dump.txt",
+             (unsigned long long)RVA_RECORD_COPY_FN);
     WriteLog("[i] No gameplay hooks installed yet - this build is for finding the real one. "
              "Fully automatic: just play normally (change players, open move menus) and the "
              "write trap finds and tracks itself every ~10s. F6=force a fresh restart of the "
