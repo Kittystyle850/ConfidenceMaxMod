@@ -55,10 +55,11 @@ static void DumpInterestingFunction(uintptr_t base) {
     fprintf(f, "Record-copy routine, module RVA 0x%llX (confirmed stable, caught via WriteTrap)\n",
             (unsigned long long)RVA_RECORD_COPY_FN);
     fprintf(f, "16 bytes per row, <HERE> marks the exact instruction the trap caught.\n\n");
-    static constexpr int kWindow = 256;
-    for (int rowStart = -kWindow; rowStart <= kWindow; rowStart += 16) {
+    static constexpr int kWindowBack = 900; // need to find this function's true prologue (rbx setup)
+    static constexpr int kWindowFwd = 128;
+    for (int rowStart = -kWindowBack; rowStart <= kWindowFwd; rowStart += 16) {
         fprintf(f, "%+5d: ", rowStart);
-        for (int i = 0; i < 16 && rowStart + i <= kWindow; ++i) {
+        for (int i = 0; i < 16 && rowStart + i <= kWindowFwd; ++i) {
             int off = rowStart + i;
             uint8_t b = 0;
             uintptr_t p = addr + off;
