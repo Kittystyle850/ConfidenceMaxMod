@@ -22,6 +22,7 @@
 #include <vector>
 #include <functional>
 #include <algorithm>
+#include "player_names.h"
 
 extern void WriteLog(const char* fmt, ...);
 

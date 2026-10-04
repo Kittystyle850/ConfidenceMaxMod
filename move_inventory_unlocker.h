@@ -14,14 +14,14 @@
 #include <windows.h>
 #include <cstdint>
 #include <string>
-#include "custom_player_editor.h" // reuses ReadQ/ReadD/Resolve()
+#include "save_pointer.h"
 
 extern void WriteLog(const char* fmt, ...);
 
 namespace MoveInventoryUnlocker {
 
-using CustomPlayerEditor::ReadQ;
-using CustomPlayerEditor::ReadD;
+using SavePointer::ReadQ;
+using SavePointer::ReadD;
 
 inline bool ReadFStringAscii(uintptr_t dataPtr, uint32_t count, std::string& out) {
     if (count < 2 || count > 0x400) return false;
