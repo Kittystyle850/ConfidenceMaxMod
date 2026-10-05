@@ -1,44 +1,46 @@
 // ============================================================
 //  write_trap.h  -  "find out what accesses this address" (CE-style),
-//                    self-rearming and deduplicated
+//                    multi-target, self-rearming, deduplicated
 //  ------------------------------------------------------------
-//  Mark the 4KB page containing the watched address with PAGE_GUARD.
-//  The next access raises STATUS_GUARD_PAGE_VIOLATION, caught here
-//  via a Vectored Exception Handler. Windows auto-clears PAGE_GUARD
-//  after each trap, so we re-arm it ourselves every time - meaning
-//  this keeps watching across however many menu navigations the
-//  user does, instead of needing an F6 press per attempt.
-//
-//  Naive "log every hit" would flood the file if something (e.g.
-//  render code) reads this memory every frame. Instead we dedupe by
-//  RIP: each NEW distinct instruction address gets one full report
-//  block (with a code dump), repeats of an already-seen RIP just
-//  bump a counter silently. Stops auto-rearming after kMaxDistinctRips
-//  distinct hits or kAutoDisarmMs, whichever comes first.
+//  Watches up to kMaxSlots labeled addresses AT THE SAME TIME (e.g.
+//  "Izawa" = a regular player, "CustomPlayer" = the user-made one),
+//  via PAGE_GUARD + a Vectored Exception Handler. Each hit is
+//  attributed to whichever slot's page it belongs to, deduped by
+//  (slot, RIP) pair, so the report directly shows whether opening
+//  the move-equip menu for a regular player hits the SAME code as
+//  for the custom player (data-driven restriction, no code branch to
+//  patch) or a DIFFERENT one (a real branch we can hook/bypass).
 // ============================================================
 #pragma once
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <string>
 #include <vector>
 
 extern void WriteLog(const char* fmt, ...);
 
 namespace WriteTrap {
 
-inline uintptr_t g_watchAddr = 0;
-inline uintptr_t g_watchPageBase = 0;
-inline size_t    g_pageSize = 0x1000;
-inline bool      g_armed = false;
-inline void*     g_vehHandle = nullptr;
+static constexpr int kMaxSlots = 4;
+static constexpr int kMaxDistinctRipsPerSlot = 20; // per label, so two labels = up to 40 total
 
-struct SeenRip { uintptr_t rip; int count; };
+struct Slot {
+    char      label[32] = {};
+    uintptr_t watchAddr = 0;
+    uintptr_t pageBase = 0;
+    bool      armed = false;
+    bool      finished = false;
+};
+inline Slot g_slots[kMaxSlots];
+inline int  g_slotCount = 0;
+
+struct SeenRip { int slot; uintptr_t rip; int count; };
 inline std::vector<SeenRip> g_seenRips;
 inline int   g_totalHits = 0;
-inline DWORD g_armStartTick = 0;
-
-static constexpr int kMaxDistinctRips = 40; // accumulates for the WHOLE session now, not per-arm
-inline bool g_finished = false;
+inline void* g_vehHandle = nullptr;
+inline size_t g_pageSize = 0x1000;
 
 inline void DumpCodeAround(FILE* f, uintptr_t rip) {
     fprintf(f, "  code bytes RIP-32..RIP+32:\n   ");
@@ -52,41 +54,51 @@ inline void DumpCodeAround(FILE* f, uintptr_t rip) {
     fprintf(f, "\n");
 }
 
-inline bool Rearm() {
+inline bool RearmSlot(Slot& s) {
     MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(reinterpret_cast<LPCVOID>(g_watchPageBase), &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(s.pageBase), &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
     DWORD oldProt = 0;
-    DWORD baseProt = mbi.Protect & ~PAGE_GUARD; // don't stack GUARD onto itself
-    return VirtualProtect(reinterpret_cast<LPVOID>(g_watchPageBase), g_pageSize,
-                           baseProt | PAGE_GUARD, &oldProt) != 0;
+    DWORD baseProt = mbi.Protect & ~PAGE_GUARD;
+    return VirtualProtect(reinterpret_cast<LPVOID>(s.pageBase), g_pageSize, baseProt | PAGE_GUARD, &oldProt) != 0;
+}
+
+inline int CountDistinctForSlot(int slotIdx) {
+    int n = 0;
+    for (auto& r : g_seenRips) if (r.slot == slotIdx) ++n;
+    return n;
 }
 
 inline LONG CALLBACK GuardPageHandler(EXCEPTION_POINTERS* ep) {
-    if (!g_armed) return EXCEPTION_CONTINUE_SEARCH;
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_GUARD_PAGE) return EXCEPTION_CONTINUE_SEARCH;
-
     uintptr_t faultAddr = static_cast<uintptr_t>(ep->ExceptionRecord->ExceptionInformation[1]);
-    if (faultAddr < g_watchPageBase || faultAddr >= g_watchPageBase + g_pageSize)
-        return EXCEPTION_CONTINUE_SEARCH; // not our page
 
+    int hitSlot = -1;
+    for (int i = 0; i < g_slotCount; ++i) {
+        Slot& s = g_slots[i];
+        if (s.armed && faultAddr >= s.pageBase && faultAddr < s.pageBase + g_pageSize) { hitSlot = i; break; }
+    }
+    if (hitSlot < 0) return EXCEPTION_CONTINUE_SEARCH; // not one of ours
+
+    Slot& s = g_slots[hitSlot];
     uintptr_t rip = static_cast<uintptr_t>(ep->ContextRecord->Rip);
     ++g_totalHits;
 
     SeenRip* existing = nullptr;
-    for (auto& s : g_seenRips) if (s.rip == rip) { existing = &s; break; }
+    for (auto& r : g_seenRips) if (r.slot == hitSlot && r.rip == rip) { existing = &r; break; }
 
     if (existing) {
-        ++existing->count; // already logged this one in full, just count it
-    } else if (static_cast<int>(g_seenRips.size()) < kMaxDistinctRips) {
-        g_seenRips.push_back({ rip, 1 });
+        ++existing->count;
+    } else if (CountDistinctForSlot(hitSlot) < kMaxDistinctRipsPerSlot) {
+        g_seenRips.push_back({ hitSlot, rip, 1 });
         uintptr_t modBase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
 
         FILE* f = nullptr;
         fopen_s(&f, "CT2_WriteTrap_Report.txt", "a");
         if (f) {
-            fprintf(f, "=== hit #%d, distinct RIP #%zu ===\n", g_totalHits, g_seenRips.size());
+            fprintf(f, "=== [%s] hit #%d, distinct RIP #%d for this label ===\n",
+                    s.label, g_totalHits, CountDistinctForSlot(hitSlot));
             fprintf(f, "  watched address: 0x%llX   faulting access: 0x%llX\n",
-                    (unsigned long long)g_watchAddr, (unsigned long long)faultAddr);
+                    (unsigned long long)s.watchAddr, (unsigned long long)faultAddr);
             fprintf(f, "  RIP: 0x%llX", (unsigned long long)rip);
             if (modBase && rip >= modBase) fprintf(f, "  (module RVA = 0x%llX)", (unsigned long long)(rip - modBase));
             fprintf(f, "\n  RCX=0x%llX RDX=0x%llX R8=0x%llX R9=0x%llX\n",
@@ -100,74 +112,62 @@ inline LONG CALLBACK GuardPageHandler(EXCEPTION_POINTERS* ep) {
             fprintf(f, "\n");
             fclose(f);
         }
-        WriteLog("[+] WriteTrap: new distinct RIP #%zu = 0x%llX (total hits so far: %d)",
-                 g_seenRips.size(), (unsigned long long)rip, g_totalHits);
+        WriteLog("[+] WriteTrap[%s]: new distinct RIP = 0x%llX (total hits: %d)",
+                 s.label, (unsigned long long)rip, g_totalHits);
     }
 
-    if (static_cast<int>(g_seenRips.size()) >= kMaxDistinctRips) {
-        g_armed = false;
-        g_finished = true;
-        FILE* f = nullptr;
-        fopen_s(&f, "CT2_WriteTrap_Report.txt", "a");
-        if (f) {
-            fprintf(f, "=== watch finished (distinct-RIP cap reached): %d total hits, %zu distinct RIPs ===\n\n",
-                    g_totalHits, g_seenRips.size());
-            fclose(f);
-        }
-        WriteLog("[i] WriteTrap: finished (cap reached) - %d total hits, %zu distinct RIPs, see CT2_WriteTrap_Report.txt",
-                 g_totalHits, g_seenRips.size());
-        return EXCEPTION_CONTINUE_EXECUTION; // leave the page unguarded
+    if (CountDistinctForSlot(hitSlot) >= kMaxDistinctRipsPerSlot) {
+        s.armed = false;
+        s.finished = true;
+        WriteLog("[i] WriteTrap[%s]: finished (cap reached) - see CT2_WriteTrap_Report.txt", s.label);
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    Rearm(); // keep watching the same page
+    RearmSlot(s);
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 inline void EnsureHandlerInstalled() {
     if (!g_vehHandle) g_vehHandle = AddVectoredExceptionHandler(1, GuardPageHandler);
+    if (g_pageSize == 0x1000) {
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        if (si.dwPageSize) g_pageSize = si.dwPageSize;
+    }
 }
 
-inline bool ArmInternal(uintptr_t addr, bool verbose) {
+// Finds (or creates) the slot for `label`, points it at `addr`, keeping
+// anything already collected under that same label. This is what both
+// the manual hotkeys and the automatic background loop use - call it as
+// often as you like, re-targeting is cheap and non-destructive.
+inline bool Watch(const char* label, uintptr_t addr) {
+    if (!addr) return false;
     EnsureHandlerInstalled();
-    SYSTEM_INFO si{};
-    GetSystemInfo(&si);
-    g_pageSize = si.dwPageSize ? si.dwPageSize : 0x1000;
-    g_watchAddr = addr;
-    g_watchPageBase = addr & ~(static_cast<uintptr_t>(g_pageSize) - 1);
 
-    if (!Rearm()) {
-        WriteLog("[!] WriteTrap: VirtualProtect failed on 0x%llX (err=%lu)",
-                 (unsigned long long)g_watchPageBase, GetLastError());
-        return false;
+    int idx = -1;
+    for (int i = 0; i < g_slotCount; ++i) if (strcmp(g_slots[i].label, label) == 0) { idx = i; break; }
+    if (idx < 0) {
+        if (g_slotCount >= kMaxSlots) { WriteLog("[!] WriteTrap: no free slot for '%s'", label); return false; }
+        idx = g_slotCount++;
+        strncpy_s(g_slots[idx].label, label, sizeof(g_slots[idx].label) - 1);
     }
-    g_armed = true;
-    if (verbose) {
-        WriteLog("[i] WriteTrap: watching 0x%llX, self-rearming up to %d distinct instructions "
-                  "(accumulates for the whole session).", (unsigned long long)addr, kMaxDistinctRips);
-    }
-    return true;
+    Slot& s = g_slots[idx];
+    if (s.finished) return false; // this label already hit its cap, leave it alone
+
+    s.watchAddr = addr;
+    s.pageBase = addr & ~(static_cast<uintptr_t>(g_pageSize) - 1);
+    bool ok = RearmSlot(s);
+    s.armed = ok;
+    return ok;
 }
 
-// Starts a watch session on the page containing `addr`, clearing any
-// accumulated findings first - only used by the manual F6 hotkey, for
-// an explicit "start fresh" request.
-inline bool ArmFresh(uintptr_t addr) {
-    g_seenRips.clear();
-    g_totalHits = 0;
-    g_finished = false;
-    g_armStartTick = GetTickCount();
-    return ArmInternal(addr, true);
-}
-
-// Re-points the watch at a new address WITHOUT clearing anything already
-// collected - this is what the automatic background loop uses, since the
-// array keeps getting reallocated at a different address every time the
-// roster screen is touched, but we still want one cumulative report.
-inline bool RetargetKeepHistory(uintptr_t addr) {
-    if (g_finished) return false; // already hit the cap, stop bothering it
-    bool first = (g_armStartTick == 0);
-    if (first) g_armStartTick = GetTickCount();
-    return ArmInternal(addr, false);
+// Explicit reset for one label (clears its collected RIPs) - only used by
+// the manual F6 hotkey for an intentional "start this one over".
+inline void ResetLabel(const char* label) {
+    for (int i = (int)g_seenRips.size() - 1; i >= 0; --i)
+        if (g_slots[g_seenRips[i].slot].label == std::string(label)) g_seenRips.erase(g_seenRips.begin() + i);
+    for (int i = 0; i < g_slotCount; ++i)
+        if (strcmp(g_slots[i].label, label) == 0) g_slots[i].finished = false;
 }
 
 } // namespace WriteTrap

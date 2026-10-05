@@ -9,18 +9,18 @@
 //  prerequisite we've already confirmed (move-card ownership, which
 //  turned out necessary-but-not-sufficient on its own).
 //
-//  Hotkeys:
-//    F8  - fingerprint scan: locate known players (Izawa/Sawada/
-//          Hyuga) anywhere in process memory, report candidates.
-//    F7  - re-finds the Izawa anchor, dumps the surrounding array
-//          sequence, and chases the pointer chain up to 5 hops
-//          looking for something stable inside the game module.
-//    F6  - arms a self-rearming write/access trap on whatever F7
-//          last found - catches the actual instruction(s) that
-//          touch that memory, deduped by RIP.
+//  Fully automatic, no keys needed for the main workflow: every ~10s
+//  the DLL re-locates Izawa (a regular player) AND the Custom Player's
+//  live moveset, and watches BOTH at once. Open the move-equip menu
+//  for each and compare: same RIP on both = data-driven restriction;
+//  different RIP = a real code branch worth hooking.
+//
+//  Hotkeys (manual overrides / diagnostics, rarely needed now):
+//    F8  - fingerprint scan report (no watching).
+//    F7  - array dump + pointer chase diagnostic.
+//    F6  - reset both watches and start collecting fresh.
 //    F9  - unload the DLL.
-//    ESC - stop the watcher thread (anything already armed/applied
-//          stays as-is).
+//    ESC - stop the watcher thread (anything already armed stays armed).
 //
 //  Log: CT2CheatDLL_log.txt (next to the game EXE)
 // ============================================================
@@ -104,16 +104,17 @@ static DWORD WINAPI MainThread(LPVOID) {
     DumpInterestingFunction(base);
     WriteLog("[i] Dumped the record-copy routine (RVA 0x%llX) to CT2_InterestingFunction_Dump.txt",
              (unsigned long long)RVA_RECORD_COPY_FN);
-    WriteLog("[i] No gameplay hooks installed yet - this build is for finding the real one. "
-             "Fully automatic: just play normally (change players, open move menus) and the "
-             "write trap finds and tracks itself every ~10s. F6=force a fresh restart of the "
-             "watch, F7/F8=manual diagnostics, F9=unload.");
+    WriteLog("[i] No gameplay hooks installed yet. Fully automatic: every ~10s this watches BOTH "
+             "a regular player (Izawa) and your Custom Player's live moveset at once. Open the "
+             "move-equip menu on each and compare the RVAs in CT2_WriteTrap_Report.txt. "
+             "F6=reset both watches, F7/F8=manual diagnostics, F9=unload.");
 
     bool unlockDone = false;
     int unlockAttempts = 0;
     bool lastF9 = false, lastF8 = false, lastF7 = false, lastF6 = false;
     int pollTick = 0;
     uintptr_t lastAutoAnchor = 0;
+    uintptr_t lastCustomAnchor = 0;
 
     while (true) {
         if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) { WriteLog("[i] ESC, stopping watcher thread."); break; }
@@ -132,23 +133,35 @@ static DWORD WINAPI MainThread(LPVOID) {
 
         bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
         if (f6 && !lastF6) {
-            // manual override: start a FRESH watch (clears anything collected so far)
-            if (PlayerScanner::g_lastFoundRecordAddr) WriteTrap::ArmFresh(PlayerScanner::g_lastFoundRecordAddr);
-            else WriteLog("[!] WriteTrap: no anchor found yet, wait for the automatic scan or press F7 first.");
+            WriteTrap::ResetLabel("Izawa");
+            WriteTrap::ResetLabel("CustomPlayer");
+            WriteLog("[i] WriteTrap: both watches reset, will re-arm on the next automatic pass.");
         }
         lastF6 = f6;
 
-        // Fully automatic: every ~10s, re-find Izawa and retarget the
-        // write trap at wherever he currently is - no keypress needed.
-        // Findings accumulate for the whole session (RetargetKeepHistory
-        // never clears what's already been collected).
-        if (!WriteTrap::g_finished && (pollTick % 300) == 0) { // ~10s at 30ms/tick
-            uintptr_t anchor = PlayerScanner::FindBestIzawaAnchor();
-            if (anchor && anchor != lastAutoAnchor) {
-                lastAutoAnchor = anchor;
-                PlayerScanner::g_lastFoundRecordAddr = anchor;
-                WriteTrap::RetargetKeepHistory(anchor);
-                WriteLog("[i] Auto-scan: retargeted write trap @ 0x%llX", (unsigned long long)anchor);
+        // Fully automatic, TWO watches at once: a regular player (Izawa)
+        // and the Custom Player's own live moveset (save+0x1B4, reached
+        // the same way the old custom-player editor did). If opening the
+        // move menu hits the SAME RIP for both, the restriction is
+        // data-driven, not a code branch. If it hits a DIFFERENT RIP for
+        // Izawa, that's the function to patch.
+        if ((pollTick % 300) == 0) { // ~10s at 30ms/tick
+            uintptr_t izawaAnchor = PlayerScanner::FindBestIzawaAnchor();
+            if (izawaAnchor && izawaAnchor != lastAutoAnchor) {
+                lastAutoAnchor = izawaAnchor;
+                PlayerScanner::g_lastFoundRecordAddr = izawaAnchor;
+                if (WriteTrap::Watch("Izawa", izawaAnchor))
+                    WriteLog("[i] Auto-scan: watching Izawa @ 0x%llX", (unsigned long long)izawaAnchor);
+            }
+
+            auto chain = SavePointer::Resolve();
+            if (chain.ok) {
+                uintptr_t customAddr = chain.save + 0x1B4; // confirmed offset from earlier work
+                if (customAddr != lastCustomAnchor) {
+                    lastCustomAnchor = customAddr;
+                    if (WriteTrap::Watch("CustomPlayer", customAddr))
+                        WriteLog("[i] Auto-scan: watching CustomPlayer @ 0x%llX", (unsigned long long)customAddr);
+                }
             }
         }
 
