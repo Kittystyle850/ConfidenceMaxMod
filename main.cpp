@@ -183,6 +183,8 @@ static DWORD WINAPI MainThread(LPVOID) {
                 }
             }
         }
+        WriteTrap::DrainPending(); // safe context: actual file I/O happens here, never in the VEH handler
+
         ++pollTick;
 
         Sleep(30);
