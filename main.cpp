@@ -47,19 +47,22 @@ static constexpr const char* TRAINER_VER  = "0.4";
 // now - no need to catch it via the trap again, it's not heap-based.
 static constexpr uintptr_t RVA_RECORD_COPY_FN = 0x48E3870;
 
-static void DumpInterestingFunction(uintptr_t base) {
+// Second confirmed-stable find: a comparison inside what looks like a
+// linear-search loop (cmp [rcx+rdx],r11d ; je found), caught watching
+// Izawa. Candidate for the per-character move-allow-list check.
+static constexpr uintptr_t RVA_IZAWA_COMPARE_FN = 0x4A9CFD9;
+
+static void DumpFunctionAt(uintptr_t base, uintptr_t rva, const char* label,
+                            const char* outPath, int windowBack, int windowFwd) {
     if (!base) return;
-    uintptr_t addr = base + RVA_RECORD_COPY_FN;
+    uintptr_t addr = base + rva;
     FILE* f = nullptr;
-    if (fopen_s(&f, "CT2_InterestingFunction_Dump.txt", "w") != 0 || !f) return;
-    fprintf(f, "Record-copy routine, module RVA 0x%llX (confirmed stable, caught via WriteTrap)\n",
-            (unsigned long long)RVA_RECORD_COPY_FN);
+    if (fopen_s(&f, outPath, "w") != 0 || !f) return;
+    fprintf(f, "%s, module RVA 0x%llX (confirmed stable, caught via WriteTrap)\n", label, (unsigned long long)rva);
     fprintf(f, "16 bytes per row, <HERE> marks the exact instruction the trap caught.\n\n");
-    static constexpr int kWindowBack = 900; // need to find this function's true prologue (rbx setup)
-    static constexpr int kWindowFwd = 128;
-    for (int rowStart = -kWindowBack; rowStart <= kWindowFwd; rowStart += 16) {
+    for (int rowStart = -windowBack; rowStart <= windowFwd; rowStart += 16) {
         fprintf(f, "%+5d: ", rowStart);
-        for (int i = 0; i < 16 && rowStart + i <= kWindowFwd; ++i) {
+        for (int i = 0; i < 16 && rowStart + i <= windowFwd; ++i) {
             int off = rowStart + i;
             uint8_t b = 0;
             uintptr_t p = addr + off;
@@ -101,9 +104,13 @@ void WriteLog(const char* fmt, ...) {
 static DWORD WINAPI MainThread(LPVOID) {
     uintptr_t base = SavePointer::ModuleBase();
     WriteLog("[i] %s v%s started. base=0x%llX", TRAINER_NAME, TRAINER_VER, (unsigned long long)base);
-    DumpInterestingFunction(base);
-    WriteLog("[i] Dumped the record-copy routine (RVA 0x%llX) to CT2_InterestingFunction_Dump.txt",
-             (unsigned long long)RVA_RECORD_COPY_FN);
+
+    DumpFunctionAt(base, RVA_RECORD_COPY_FN, "Record-copy routine",
+                   "CT2_InterestingFunction_Dump.txt", 900, 128);
+    DumpFunctionAt(base, RVA_IZAWA_COMPARE_FN, "Izawa linear-search compare",
+                   "CT2_IzawaCompare_Dump.txt", 600, 400);
+    WriteLog("[i] Dumped both confirmed-stable functions to CT2_InterestingFunction_Dump.txt "
+             "and CT2_IzawaCompare_Dump.txt");
     WriteLog("[i] No gameplay hooks installed yet. Fully automatic: every ~10s this watches BOTH "
              "a regular player (Izawa) and your Custom Player's live moveset at once. Open the "
              "move-equip menu on each and compare the RVAs in CT2_WriteTrap_Report.txt. "

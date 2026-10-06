@@ -226,7 +226,18 @@ inline void DrainPending() {
 
         if (opened) {
             fprintf(f, "=== [%s] RIP 0x%llX", label, (unsigned long long)ph.rip);
-            if (modBase && ph.rip >= modBase) fprintf(f, " (module RVA = 0x%llX)", (unsigned long long)(ph.rip - modBase));
+            // bounds-checked now: rip must be BELOW moduleBase+moduleSize too,
+            // otherwise it's some other loaded module and printing an "RVA"
+            // is meaningless (was producing bogus multi-GB values before).
+            if (modBase) {
+                auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(modBase);
+                auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(modBase + dos->e_lfanew);
+                uintptr_t modSize = nt->OptionalHeader.SizeOfImage;
+                if (ph.rip >= modBase && ph.rip < modBase + modSize)
+                    fprintf(f, " (module RVA = 0x%llX)", (unsigned long long)(ph.rip - modBase));
+                else
+                    fprintf(f, " (NOT in main module - some other loaded library)");
+            }
             fprintf(f, " ===\n");
             fprintf(f, "  watched address: 0x%llX   faulting access: 0x%llX\n",
                     (unsigned long long)(ph.slot >= 0 ? g_slots[ph.slot].watchAddr : 0),
