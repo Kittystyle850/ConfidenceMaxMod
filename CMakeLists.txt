@@ -15,3 +15,4 @@ set_target_properties(CT2CheatDLL PROPERTIES
 
 target_compile_options(CT2CheatDLL PRIVATE /std:c++17 /O2 /Ob2 /Oi /Ot /EHsc)
 target_compile_definitions(CT2CheatDLL PRIVATE UNICODE _UNICODE)
+target_link_libraries(CT2CheatDLL PRIVATE user32 gdi32 comctl32)

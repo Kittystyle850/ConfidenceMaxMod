@@ -37,6 +37,7 @@ void WriteLog(const char* fmt, ...);
 #include "move_inventory_unlocker.h"
 #include "player_scanner.h"
 #include "write_trap.h"
+#include "gui.h"
 
 static constexpr const char* TRAINER_NAME = "CT2 AllMoves (research build)";
 static constexpr const char* TRAINER_VER  = "0.4";
@@ -111,6 +112,9 @@ static DWORD WINAPI MainThread(LPVOID) {
                    "CT2_IzawaCompare_Dump.txt", 600, 400);
     WriteLog("[i] Dumped both confirmed-stable functions to CT2_InterestingFunction_Dump.txt "
              "and CT2_IzawaCompare_Dump.txt");
+
+    Gui::Launch();
+    WriteLog("[i] GUI window launched.");
     WriteLog("[i] No gameplay hooks installed yet. Fully automatic: every ~10s this watches BOTH "
              "a regular player (Izawa) and your Custom Player's live moveset at once. Open the "
              "move-equip menu on each and compare the RVAs in CT2_WriteTrap_Report.txt. "
