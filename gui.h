@@ -177,7 +177,7 @@ inline DWORD WINAPI GuiThread(LPVOID) {
     wc.hInstance = GetModuleHandleA(nullptr);
     wc.lpszClassName = "CT2AllMovesGuiClass";
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+    wc.hCursor = LoadCursorA(nullptr, MAKEINTRESOURCEA(32512)); // IDC_ARROW, forced ANSI (UNICODE define would otherwise widen it)
     RegisterClassA(&wc);
 
     HWND hwnd = CreateWindowExA(WS_EX_TOPMOST, wc.lpszClassName, "CT2 AllMoves",
