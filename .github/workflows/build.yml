@@ -1,28 +1,23 @@
-name: Build CT2CheatDLL
+name: Build CT2 Unique Limit Mod
 
 on:
   push:
-    branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
-    - name: Checkout del codice
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Configura CMake (x64)
-      run: cmake -B ${{github.workspace}}/build -A x64
+      - name: Configure
+        run: cmake -B build -A x64
 
-    - name: Compila il progetto
-      run: cmake --build ${{github.workspace}}/build --config Release
+      - name: Build
+        run: cmake --build build --config Release
 
-    - name: Carica la DLL compilata
-      uses: actions/upload-artifact@v4
-      with:
-        name: CT2CheatDLL
-        path: ${{github.workspace}}/build/Release/CT2CheatDLL.dll
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: CT2_UniqueLimit4
+          path: build/Release/CT2_UniqueLimit4.dll
