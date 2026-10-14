@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.15)
 cmake_policy(SET CMP0091 NEW)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")   # static CRT: no VC++ redist needed
 
+option(SOW_ENABLE_FILES "Debug: write log/drops files next to the DLL" OFF)
+
 project(ShadowOfWarMod VERSION 1.0 LANGUAGES CXX ASM_MASM)
 
 add_library(ShadowOfWarMod SHARED
@@ -21,3 +23,7 @@ endif()
 
 target_compile_definitions(ShadowOfWarMod PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(ShadowOfWarMod PRIVATE kernel32)
+
+if (SOW_ENABLE_FILES)
+    target_compile_definitions(ShadowOfWarMod PRIVATE SOW_ENABLE_FILES)
+endif()

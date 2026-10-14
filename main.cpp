@@ -1,16 +1,20 @@
 // Shadow of War (ShadowOfWar.exe, x64) - single-player mod DLL
 // Port of SeiKur0's Cheat Engine table (v21) to a native DLL.
 //
-// Features (all toggled in ShadowOfWarMod.ini, default ON):
+// Standalone: only the DLL is needed. No INI, no log, no dump files are created
+// unless built with -DSOW_ENABLE_FILES=ON (debug aid). Settings are the constants
+// in kConfig below (change them in source and rebuild).
+//
+// Features (default ON):
 //   - Uruk spawn rarity      (legendary / epic)
 //   - Get all Uruk intel
 //   - Choose multiple skills
 //   - Infinite mission time
 //   - Forced drop            (Epic/Legendary Uruks always drop the NemesisGear
-//                             entry set in [Drops] ItemId; dump file lists IDs)
+//                             entry named in kConfig.dropItem; off when empty)
 //
 // Every site is found by AOB scan and byte-verified before it is touched.
-// Inject after the game has started (any injector). Log: ShadowOfWarMod_log.txt
+// Inject after the game has started (any injector).
 
 #include <windows.h>
 #include <cstdio>
@@ -31,6 +35,7 @@ struct Config {
 };
 
 static void Log(const char* fmt, ...) {
+#ifdef SOW_ENABLE_FILES
     char msg[512];
     va_list ap; va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
@@ -41,27 +46,27 @@ static void Log(const char* fmt, ...) {
     fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, msg);
     fclose(f);
+#else
+    (void)fmt;
+#endif
 }
 
-static Config LoadConfig() {
+// Built-in settings (no INI). Edit and rebuild to change.
+static const Config kConfig = [] {
     Config c;
-    std::string ini = g_dir + "ShadowOfWarMod.ini";
-    const char* p = ini.c_str();
-    c.rarity      = GetPrivateProfileIntA("Features", "UrukSpawnRarity", 1, p) != 0;
-    c.intel       = GetPrivateProfileIntA("Features", "GetAllUrukIntel", 1, p) != 0;
-    c.skills      = GetPrivateProfileIntA("Features", "ChooseMultipleSkills", 1, p) != 0;
-    c.missionTime = GetPrivateProfileIntA("Features", "InfiniteMissionTime", 1, p) != 0;
-    c.dumpDrops   = GetPrivateProfileIntA("Drops", "DumpDropList", 1, p) != 0;
-    char buf[256];
-    GetPrivateProfileStringA("Features", "Rarity", "legendary", buf, sizeof(buf), p);
-    c.legendary = !(buf[0] == 'e' || buf[0] == 'E');
-    GetPrivateProfileStringA("Drops", "ItemId", "", buf, sizeof(buf), p);
-    std::string id = buf;
-    while (!id.empty() && (id.back() == ' ' || id.back() == '\t')) id.pop_back();
-    size_t s = id.find_first_not_of(" \t");
-    c.dropItem = (s == std::string::npos) ? "" : id.substr(s);
+    c.rarity      = true;     // Uruk spawn rarity hook
+    c.legendary   = true;     // true = legendary, false = epic
+    c.intel       = true;     // all Uruk intel
+    c.skills      = true;     // choose multiple skills
+    c.missionTime = true;     // infinite mission time
+    c.dropItem    = "";       // NemesisGear entry id to always drop ("" = off)
+#ifdef SOW_ENABLE_FILES
+    c.dumpDrops   = true;     // writes ShadowOfWarMod_drops.txt (debug build only)
+#else
+    c.dumpDrops   = false;
+#endif
     return c;
-}
+}();
 
 // ---------------------------------------------------------------------------
 // jmp-hook through a near trampoline:  site: E9 rel32 (+nops) -> tramp:
@@ -141,11 +146,14 @@ static bool ApplyMissionTime(HMODULE mod) {
 
 // returns true when finished (success OR permanent failure), false = retry later
 static bool ApplyDrops(HMODULE mod, const Config& cfg) {
+#ifdef SOW_ENABLE_FILES
     static bool dumped = false;
+#endif
     uintptr_t list = 0;
     uintptr_t db = FindGameDb(mod, "Faction/Loot/NemesisGear", list);
     if (!db) return false;                                  // gamedb not loaded yet
 
+#ifdef SOW_ENABLE_FILES
     if (cfg.dumpDrops && !dumped) {
         std::string txt = DbDumpList(list);
         FILE* f = fopen((g_dir + "ShadowOfWarMod_drops.txt").c_str(), "w");
@@ -156,7 +164,8 @@ static bool ApplyDrops(HMODULE mod, const Config& cfg) {
         Log("[i] drop list dumped (%zu bytes) -> ShadowOfWarMod_drops.txt", txt.size());
         dumped = true;
     }
-    if (cfg.dropItem.empty()) { Log("[i] [Drops] ItemId empty - forced drop not installed"); return true; }
+#endif
+    if (cfg.dropItem.empty()) { Log("[i] dropItem empty - forced drop not installed"); return true; }
 
     uintptr_t entry = DbEntryBase(list, cfg.dropItem);
     if (!entry) { Log("[-] drop item '%s' not found in NemesisGear - check the dump file", cfg.dropItem.c_str()); return true; }
@@ -178,7 +187,7 @@ static bool ApplyDrops(HMODULE mod, const Config& cfg) {
 }
 
 static DWORD WINAPI MainThread(LPVOID) {
-    Config cfg = LoadConfig();
+    const Config& cfg = kConfig;
     Log("[i] ShadowOfWarMod started (rarity=%d/%s intel=%d skills=%d time=%d drop='%s')",
         cfg.rarity, cfg.legendary ? "legendary" : "epic", cfg.intel, cfg.skills, cfg.missionTime,
         cfg.dropItem.c_str());
