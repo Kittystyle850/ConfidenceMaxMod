@@ -1,4 +1,3 @@
 build/
 *.log
-*.txt
-!README.md
+ShadowOfWarMod_drops.txt
