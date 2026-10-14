@@ -1,4 +1,4 @@
-name: Build CT2 Unique Limit Mod
+name: Build ShadowOfWarMod
 
 on:
   push:
@@ -16,8 +16,15 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build/Release/ShadowOfWarMod.dll dist/
+          Copy-Item ShadowOfWarMod.ini dist/
+
       - name: Upload DLL
         uses: actions/upload-artifact@v4
         with:
-          name: CT2_UniqueLimit4
-          path: build/Release/CT2_UniqueLimit4.dll
+          name: ShadowOfWarMod
+          path: dist/
