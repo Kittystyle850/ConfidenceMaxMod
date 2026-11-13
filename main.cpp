@@ -1,15 +1,7 @@
 // Onimusha: Way of the Sword - standalone mod DLL.
 // Port of animation_cancel.lua + instant_parry.lua.
-// Target build: Steam 24769601 / 01.000.001, TimeDateStamp 0x6A827CEA,
+// Target: Steam 24769601 / 01.000.001, TimeDateStamp 0x6A827CEA,
 // SizeOfImage 0x249F0000, image base 0x140000000.
-//
-// All RVAs and field offsets come from two REFramework dumps; no AOB scan.
-// Core mechanism (phase writes into cCancelCommand._Phase) is signature-safe:
-// every field is a known offset, every key is read from the live layer object.
-//
-// Optional features (WrapperOverrides) call functions whose exact native
-// signature is ambiguous — enable only if the core works and some commands
-// still get blocked.
 
 #include <windows.h>
 #include <cstdint>
@@ -31,15 +23,15 @@ static constexpr DWORD     kSizeOfImage = 0x249F0000;
 static constexpr uintptr_t kBase        = 0x140000000;
 
 // ─────────────────────────────────────────────────────────────
-// RVAs (absolute - 0x140000000), from REFramework dumps
+// RVAs (from REFramework dumps; all absolute - 0x140000000)
 // ─────────────────────────────────────────────────────────────
 static constexpr uintptr_t RVA_PACC_LATEUPDATE      = 0x49A55A0;
 static constexpr uintptr_t RVA_PCC_UPDATE           = 0x2015F0;
 static constexpr uintptr_t RVA_PAS_UPDATE           = 0x455340;
+static constexpr uintptr_t RVA_JFU_GETJUSTFRAME     = 0x9D7BB0;   // <-- FIXED (was 0x5101170)
+static constexpr uintptr_t RVA_JFU_UPDATE           = 0x40D950;
 static constexpr uintptr_t RVA_PCE_CHECKCANCEL_T    = 0x4B23C10;
 static constexpr uintptr_t RVA_PCE_CHECKPRECANCEL_T = 0x4B23C50;
-static constexpr uintptr_t RVA_JFU_UPDATE           = 0x40D950;
-static constexpr uintptr_t RVA_JFU_GETJUSTFRAME     = 0x5101170;
 static constexpr uintptr_t RVA_CB_GETACTIONSTATE    = 0x49A1D10;
 static constexpr uintptr_t RVA_JDS_ISACCEPTING      = 0x760A450;
 
@@ -62,7 +54,7 @@ static constexpr uintptr_t OFF_ARR_COUNT    = 0x1C;
 static constexpr uintptr_t OFF_ARR_DATA     = 0x20;
 
 // ─────────────────────────────────────────────────────────────
-// Enum values
+// Command enum
 // ─────────────────────────────────────────────────────────────
 enum Cmd : uint32_t {
     CMD_ONI_CHANGE=0, CMD_ONI_EYE=1, CMD_PARRY=2, CMD_BLOCK=3, CMD_JUST_DODGE=4,
@@ -89,7 +81,6 @@ static constexpr uint64_t BLOCK_BIT       = 0x8000000ull;
 static constexpr uint64_t PARRY_BIT       = 0x10000000ull;
 static constexpr uint64_t EVADE_BIT       = 0x20000000ull;
 
-// held = choke point: never cancel out of a choreographed or reaction state
 static constexpr uint64_t HELD_MASK = GRAPPLE_BIT | DAMAGE_BIT | SMASH_BIT |
     BLOCKED_BIT | GUARD_BREAK_BIT | BLOCK_BIT | PARRY_BIT;
 
@@ -101,48 +92,27 @@ static constexpr int CAT_NONE = -1;
 
 struct KeyDef { uint32_t cmd; uintptr_t offset; Cat cat; };
 static const KeyDef kKeys[] = {
-    { CMD_ONI_CHANGE,          0x50,  CAT_OTHER  },
-    { CMD_ONI_EYE,             0x58,  CAT_OTHER  },
-    { CMD_PARRY,               0x60,  CAT_GUARD  },
-    { CMD_BLOCK,               0x68,  CAT_GUARD  },
-    { CMD_JUST_DODGE,          0x70,  CAT_DODGE  },
-    { CMD_GRAB_COUNTER,        0x78,  CAT_ISSEN  },
-    { CMD_ISSEN_COUNTER,       0x80,  CAT_ISSEN  },
-    { CMD_ISSEN_BREAK,         0x88,  CAT_ISSEN  },
-    { CMD_ISSEN_BLOCK,         0x90,  CAT_ISSEN  },
-    { CMD_ISSEN_CHAIN,         0x98,  CAT_ISSEN  },
-    { CMD_GRAPPLE_BLOW,        0xA0,  CAT_OTHER  },
-    { CMD_SKILL,               0xA8,  CAT_ATTACK },
-    { CMD_SKILL_KEEP,          0xB0,  CAT_ATTACK },
-    { CMD_ULTIMATE,            0xB8,  CAT_ATTACK },
-    { CMD_ABSORB,              0xC0,  CAT_OTHER  },
-    { CMD_BOW,                 0xC8,  CAT_ATTACK },
-    { CMD_GUARD,               0xD0,  CAT_GUARD  },
-    { CMD_ATTACK_BLOW,         0xD8,  CAT_ATTACK },
-    { CMD_DODGE,               0xE0,  CAT_DODGE  },
-    { CMD_ATTACK_JUST_DODGE,   0xE8,  CAT_DODGE  },
-    { CMD_ATTACK_SNEAK,        0xF0,  CAT_ATTACK },
-    { CMD_ATTACK_LIGHT_CHARGE, 0xF8,  CAT_ATTACK },
-    { CMD_ATTACK_LIGHT_COMBO,  0x100, CAT_ATTACK },
-    { CMD_ATTACK_LIGHT,        0x108, CAT_ATTACK },
-    { CMD_ATTACK_HARD_CHARGE,  0x110, CAT_ATTACK },
-    { CMD_ATTACK_HARD_COMBO,   0x118, CAT_ATTACK },
-    { CMD_ATTACK_HARD,         0x120, CAT_ATTACK },
-    { CMD_MEDICINE,            0x128, CAT_OTHER  },
-    { CMD_ITEM,                0x130, CAT_OTHER  },
-    { CMD_INTERACT,            0x138, CAT_OTHER  },
-    { CMD_INTERACT_KEEP,       0x140, CAT_OTHER  },
-    { CMD_DASH,                0x148, CAT_MOVE   },
-    { CMD_DASH_KEEP,           0x150, CAT_MOVE   },
-    { CMD_RUN,                 0x158, CAT_MOVE   },
-    { CMD_RUN_TURN,            0x160, CAT_MOVE   },
-    { CMD_WALK,                0x168, CAT_MOVE   },
-    { CMD_WALK_KEEP,           0x170, CAT_MOVE   },
-    { CMD_WALK_STICK,          0x178, CAT_MOVE   },
-    { CMD_QUICK_STOP,          0x180, CAT_MOVE   },
-    { CMD_MENU_ITEM,           0x188, CAT_OTHER  },
-    { CMD_MENU_SKILL,          0x190, CAT_OTHER  },
-    { CMD_LOCK_ON,             0x198, CAT_MOVE   },
+    { CMD_ONI_CHANGE, 0x50, CAT_OTHER },  { CMD_ONI_EYE, 0x58, CAT_OTHER },
+    { CMD_PARRY, 0x60, CAT_GUARD },       { CMD_BLOCK, 0x68, CAT_GUARD },
+    { CMD_JUST_DODGE, 0x70, CAT_DODGE },  { CMD_GRAB_COUNTER, 0x78, CAT_ISSEN },
+    { CMD_ISSEN_COUNTER, 0x80, CAT_ISSEN }, { CMD_ISSEN_BREAK, 0x88, CAT_ISSEN },
+    { CMD_ISSEN_BLOCK, 0x90, CAT_ISSEN }, { CMD_ISSEN_CHAIN, 0x98, CAT_ISSEN },
+    { CMD_GRAPPLE_BLOW, 0xA0, CAT_OTHER },{ CMD_SKILL, 0xA8, CAT_ATTACK },
+    { CMD_SKILL_KEEP, 0xB0, CAT_ATTACK }, { CMD_ULTIMATE, 0xB8, CAT_ATTACK },
+    { CMD_ABSORB, 0xC0, CAT_OTHER },      { CMD_BOW, 0xC8, CAT_ATTACK },
+    { CMD_GUARD, 0xD0, CAT_GUARD },       { CMD_ATTACK_BLOW, 0xD8, CAT_ATTACK },
+    { CMD_DODGE, 0xE0, CAT_DODGE },       { CMD_ATTACK_JUST_DODGE, 0xE8, CAT_DODGE },
+    { CMD_ATTACK_SNEAK, 0xF0, CAT_ATTACK },{ CMD_ATTACK_LIGHT_CHARGE, 0xF8, CAT_ATTACK },
+    { CMD_ATTACK_LIGHT_COMBO, 0x100, CAT_ATTACK },{ CMD_ATTACK_LIGHT, 0x108, CAT_ATTACK },
+    { CMD_ATTACK_HARD_CHARGE, 0x110, CAT_ATTACK },{ CMD_ATTACK_HARD_COMBO, 0x118, CAT_ATTACK },
+    { CMD_ATTACK_HARD, 0x120, CAT_ATTACK },{ CMD_MEDICINE, 0x128, CAT_OTHER },
+    { CMD_ITEM, 0x130, CAT_OTHER },       { CMD_INTERACT, 0x138, CAT_OTHER },
+    { CMD_INTERACT_KEEP, 0x140, CAT_OTHER },{ CMD_DASH, 0x148, CAT_MOVE },
+    { CMD_DASH_KEEP, 0x150, CAT_MOVE },   { CMD_RUN, 0x158, CAT_MOVE },
+    { CMD_RUN_TURN, 0x160, CAT_MOVE },    { CMD_WALK, 0x168, CAT_MOVE },
+    { CMD_WALK_KEEP, 0x170, CAT_MOVE },   { CMD_WALK_STICK, 0x178, CAT_MOVE },
+    { CMD_QUICK_STOP, 0x180, CAT_MOVE },  { CMD_MENU_ITEM, 0x188, CAT_OTHER },
+    { CMD_MENU_SKILL, 0x190, CAT_OTHER }, { CMD_LOCK_ON, 0x198, CAT_MOVE },
 };
 static constexpr size_t kKeysCount = sizeof(kKeys) / sizeof(kKeys[0]);
 
@@ -155,17 +125,14 @@ static inline Cat CatOfCmd(uint32_t cmd) {
 // Config
 // ─────────────────────────────────────────────────────────────
 struct Config {
-    // Feature toggles
+    bool enabled = true;
+    bool cat[CAT_COUNT] = { true, true, true, false, false, false };
+    int  lock_guard = 0, lock_issen = -1, lock_grab = -1, lock_dodge = -1;
+    float wm_guard = 1.0f, wm_issen = 1.0f, wm_grab = 1.0f, wm_dodge = 1.0f;
     bool feat_phase = true, feat_mask = true, feat_lockout = true,
          feat_window = true, feat_reflex = true, feat_wrappers = false;
-    // Category toggles (matched to Lua defaults)
-    bool cat[CAT_COUNT] = { true, true, true, false, false, false };
-    // Lockout frames (-1 = game default)
-    int lock_guard = 0, lock_issen = -1, lock_grab = -1, lock_dodge = -1;
-    // Window multipliers
-    float wm_guard = 1.0f, wm_issen = 1.0f, wm_grab = 1.0f, wm_dodge = 1.0f;
-    // Runtime
-    bool enabled = true;
+    bool hook_late = true, hook_ctrl = true, hook_sel = true, hook_gjf = true;
+    bool safe_mode = false;
     bool log_on = true;
     bool hotkey_f1 = true;
 } g_cfg;
@@ -181,19 +148,18 @@ struct RuntimeState {
     void*    seq = nullptr;
     uint32_t seq_count = 0;
     std::unordered_map<uintptr_t, std::vector<LayerKeys>> layer_cache;
-
     void*    jfu = nullptr;
     void*    jparam = nullptr;
     int      orig_guard = -1, orig_issen = -1, orig_grab = -1, orig_dodge = -1;
-
     int64_t  state = 0;
     bool     jd_open = false;
     bool     held = false;
     int      skip_cat = CAT_NONE;
-
     uint64_t frame = 0;
     uint64_t state_frame = (uint64_t)-1;
     uint64_t hotkey_prev = 0;
+    int      gjf_calls = 0;
+    uint64_t last_entity_resolve = 0;
 } g_rt;
 
 // ─────────────────────────────────────────────────────────────
@@ -215,43 +181,30 @@ static void Log(const char* fmt, ...) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Safe memory access (MSVC SEH)
+// Safe memory access
 // ─────────────────────────────────────────────────────────────
 template<typename T>
 static bool SafeRead(void* base, uintptr_t off, T& out) {
-    __try {
-        out = *(T*)((uintptr_t)base + off);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
+    __try { out = *(T*)((uintptr_t)base + off); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
-
 template<typename T>
 static bool SafeWrite(void* base, uintptr_t off, T v) {
-    __try {
-        *(T*)((uintptr_t)base + off) = v;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
+    __try { *(T*)((uintptr_t)base + off) = v; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
-
 static inline void* RdPtr(void* base, uintptr_t off) {
-    void* v = nullptr;
-    return SafeRead(base, off, v) ? v : nullptr;
+    void* v = nullptr; return SafeRead(base, off, v) ? v : nullptr;
 }
-static inline int64_t RdI64(void* base, uintptr_t off, int64_t def = 0) {
-    int64_t v = def;
-    return SafeRead(base, off, v) ? v : def;
+static inline int64_t RdI64(void* base, uintptr_t off, int64_t d = 0) {
+    int64_t v = d; return SafeRead(base, off, v) ? v : d;
 }
-static inline int32_t RdI32(void* base, uintptr_t off, int32_t def = 0) {
-    int32_t v = def;
-    return SafeRead(base, off, v) ? v : def;
+static inline int32_t RdI32(void* base, uintptr_t off, int32_t d = 0) {
+    int32_t v = d; return SafeRead(base, off, v) ? v : d;
 }
 
 // ─────────────────────────────────────────────────────────────
-// Config loader (simple INI, no dependencies)
+// Config loader
 // ─────────────────────────────────────────────────────────────
 static void LoadConfig() {
     char path[MAX_PATH];
@@ -262,14 +215,12 @@ static void LoadConfig() {
     auto dot = ini.find_last_of('.');
     ini = (dot == std::string::npos) ? ini + ".ini" : ini.substr(0, dot) + ".ini";
 
-    auto I = [&](const char* s, const char* k, int def) {
-        return (int)GetPrivateProfileIntA(s, k, def, ini.c_str());
+    auto I = [&](const char* s, const char* k, int d) {
+        return (int)GetPrivateProfileIntA(s, k, d, ini.c_str());
     };
-    auto F = [&](const char* s, const char* k, float def) {
-        char buf[64];
-        GetPrivateProfileStringA(s, k, "", buf, sizeof(buf), ini.c_str());
-        if (!buf[0]) return def;
-        return (float)atof(buf);
+    auto F = [&](const char* s, const char* k, float d) {
+        char buf[64]; GetPrivateProfileStringA(s, k, "", buf, sizeof(buf), ini.c_str());
+        return buf[0] ? (float)atof(buf) : d;
     };
     g_cfg.enabled         = I("AnimationCancel", "Enabled", 1) != 0;
     g_cfg.cat[CAT_ATTACK] = I("AnimationCancel", "Attacks", 1) != 0;
@@ -292,22 +243,27 @@ static void LoadConfig() {
     g_cfg.feat_window     = I("Features", "WindowMultiplier", 1) != 0;
     g_cfg.feat_reflex     = I("Features", "ReflexHold", 1) != 0;
     g_cfg.feat_wrappers   = I("Features", "WrapperOverrides", 0) != 0;
+    g_cfg.hook_late       = I("Hooks", "LateUpdate", 1) != 0;
+    g_cfg.hook_ctrl       = I("Hooks", "CtrlUpdate", 1) != 0;
+    g_cfg.hook_sel        = I("Hooks", "SelUpdate", 1) != 0;
+    g_cfg.hook_gjf        = I("Hooks", "GetJustFrame", 1) != 0;
+    g_cfg.safe_mode       = I("Debug", "SafeMode", 0) != 0;
     g_cfg.log_on          = I("Debug", "Log", 1) != 0;
     g_cfg.hotkey_f1       = I("Debug", "HotkeyF1", 1) != 0;
 
-    Log("[cfg] enabled=%d atk=%d ddg=%d grd=%d mv=%d isn=%d oth=%d",
+    Log("[cfg] enabled=%d cats a=%d d=%d g=%d m=%d i=%d o=%d",
         g_cfg.enabled, g_cfg.cat[0], g_cfg.cat[1], g_cfg.cat[2],
         g_cfg.cat[3], g_cfg.cat[4], g_cfg.cat[5]);
-    Log("[cfg] features phase=%d mask=%d lockout=%d window=%d reflex=%d wrappers=%d",
+    Log("[cfg] features phase=%d mask=%d lockout=%d window=%d reflex=%d wrap=%d",
         g_cfg.feat_phase, g_cfg.feat_mask, g_cfg.feat_lockout,
         g_cfg.feat_window, g_cfg.feat_reflex, g_cfg.feat_wrappers);
-    Log("[cfg] lockout g=%d i=%d gr=%d d=%d | window g=%.2f i=%.2f gr=%.2f d=%.2f",
-        g_cfg.lock_guard, g_cfg.lock_issen, g_cfg.lock_grab, g_cfg.lock_dodge,
-        g_cfg.wm_guard, g_cfg.wm_issen, g_cfg.wm_grab, g_cfg.wm_dodge);
+    Log("[cfg] hooks late=%d ctrl=%d sel=%d gjf=%d safe=%d",
+        g_cfg.hook_late, g_cfg.hook_ctrl, g_cfg.hook_sel, g_cfg.hook_gjf,
+        g_cfg.safe_mode);
 }
 
 // ─────────────────────────────────────────────────────────────
-// Game state helpers
+// Game calls
 // ─────────────────────────────────────────────────────────────
 static int64_t CallGetActionState(void* player) {
     if (!player) return 0;
@@ -315,7 +271,6 @@ static int64_t CallGetActionState(void* player) {
     auto fn = (Fn)(kBase + RVA_CB_GETACTIONSTATE);
     __try { return fn(player); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
-
 static bool CallIsJDAccepting(void* jds) {
     if (!jds) return false;
     typedef bool(*Fn)(void*);
@@ -323,6 +278,9 @@ static bool CallIsJDAccepting(void* jds) {
     __try { return fn(jds); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// ─────────────────────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────────────────────
 static void RefreshSeq() {
     if (!g_rt.entity) return;
     void* seq = RdPtr(g_rt.entity, OFF_PCE_SEQ);
@@ -330,11 +288,13 @@ static void RefreshSeq() {
     g_rt.seq = seq;
     g_rt.seq_count = 0;
     g_rt.layer_cache.clear();
-    if (seq) {
+    if (seq && (uintptr_t)seq >= 0x10000) {
         int32_t cnt = RdI32(seq, OFF_ARR_COUNT);
         if (cnt > 0 && cnt < 128) g_rt.seq_count = (uint32_t)cnt;
+    } else {
+        g_rt.seq = nullptr;   // reject garbage pointers
     }
-    Log("[state] seq=%p layers=%u", seq, g_rt.seq_count);
+    Log("[state] seq=%p layers=%u", g_rt.seq, g_rt.seq_count);
 }
 
 static void UpdateState() {
@@ -342,27 +302,25 @@ static void UpdateState() {
     g_rt.state_frame = g_rt.frame;
     if (!g_cfg.enabled) return;
 
-    RefreshSeq();
+    if (g_cfg.feat_phase) RefreshSeq();
+    if (g_rt.frame % 600 == 0) { g_rt.seq = nullptr; g_rt.layer_cache.clear(); }
 
-    // Periodic cache purge (matches Lua's every-600-frames re-fetch)
-    if (g_rt.frame % 600 == 0) {
-        g_rt.layer_cache.clear();
-        g_rt.seq = nullptr;
-        RefreshSeq();
+    if (g_cfg.safe_mode) {
+        g_rt.state = 0;
+        g_rt.jd_open = false;
+    } else {
+        g_rt.state = CallGetActionState(g_rt.player);
+        g_rt.jd_open = g_cfg.feat_reflex && (g_rt.state & EVADE_BIT) != 0
+            && CallIsJDAccepting(RdPtr(g_rt.entity, OFF_PCE_JDS));
     }
-
-    g_rt.state = CallGetActionState(g_rt.player);
-    g_rt.jd_open = g_cfg.feat_reflex && (g_rt.state & EVADE_BIT) != 0
-        && CallIsJDAccepting(RdPtr(g_rt.entity, OFF_PCE_JDS));
 
     bool held_new = (g_rt.state & HELD_MASK) != 0 || g_rt.jd_open;
     if (held_new != g_rt.held) {
-        Log("[state] held=%d (state=0x%llX jd=%d)",
+        Log("[state] held=%d state=0x%llX jd=%d",
             held_new, (unsigned long long)g_rt.state, g_rt.jd_open);
         g_rt.held = held_new;
     }
 
-    // Self-cancel protection (approximation of Lua's class-name-based act_cat)
     if      (g_rt.state & ATTACK_BIT) g_rt.skip_cat = CAT_ATTACK;
     else if (g_rt.state & EVADE_BIT)  g_rt.skip_cat = CAT_DODGE;
     else if (g_rt.state & (BLOCK_BIT | PARRY_BIT)) g_rt.skip_cat = CAT_GUARD;
@@ -370,7 +328,7 @@ static void UpdateState() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// ForcePhases: core of animation_cancel
+// Phase writes
 // ─────────────────────────────────────────────────────────────
 static void ForcePhases() {
     if (!g_cfg.feat_phase || !g_rt.seq || !g_cfg.enabled || g_rt.held) return;
@@ -378,7 +336,6 @@ static void ForcePhases() {
         void* layer = nullptr;
         if (!SafeRead((void*)((uintptr_t)g_rt.seq + OFF_ARR_DATA + 8 * i), 0, layer)) break;
         if (!layer) continue;
-
         auto it = g_rt.layer_cache.find((uintptr_t)layer);
         if (it == g_rt.layer_cache.end()) {
             std::vector<LayerKeys> keys;
@@ -399,7 +356,7 @@ static void ForcePhases() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Unmask: clear command-mask bits in combat
+// Mask clearing
 // ─────────────────────────────────────────────────────────────
 static void Unmask(void* mask_obj) {
     if (!g_cfg.feat_mask || !mask_obj || !g_cfg.enabled || g_rt.held) return;
@@ -415,8 +372,7 @@ static void Unmask(void* mask_obj) {
     for (const auto& kd : kKeys) {
         if (!g_cfg.cat[kd.cat]) continue;
         if (g_rt.skip_cat == (int)kd.cat) continue;
-        uint32_t w = kd.cmd >> 5;
-        uint32_t bit = 1u << (kd.cmd & 31);
+        uint32_t w = kd.cmd >> 5, bit = 1u << (kd.cmd & 31);
         if (w < (uint32_t)nwords) {
             __try { words[w] &= ~bit; } __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
@@ -428,10 +384,8 @@ static void Unmask(void* mask_obj) {
 // ─────────────────────────────────────────────────────────────
 struct LockF { uintptr_t off; int* target; };
 static LockF kLockF[] = {
-    { OFF_PARAM_GUARD, &g_cfg.lock_guard },
-    { OFF_PARAM_ISSEN, &g_cfg.lock_issen },
-    { OFF_PARAM_GRAB,  &g_cfg.lock_grab  },
-    { OFF_PARAM_DODGE, &g_cfg.lock_dodge },
+    { OFF_PARAM_GUARD, &g_cfg.lock_guard }, { OFF_PARAM_ISSEN, &g_cfg.lock_issen },
+    { OFF_PARAM_GRAB,  &g_cfg.lock_grab  }, { OFF_PARAM_DODGE, &g_cfg.lock_dodge },
 };
 
 static void AdoptJFU(void* jfu) {
@@ -439,50 +393,43 @@ static void AdoptJFU(void* jfu) {
     if (jfu == g_rt.jfu && g_rt.jparam) return;
     g_rt.jfu = jfu;
     void* param = RdPtr(jfu, OFF_JFU_PARAM);
-    if (!param) return;
-    if (param == g_rt.jparam) return;
+    if (!param || param == g_rt.jparam) return;
     g_rt.jparam = param;
     g_rt.orig_guard = RdI32(param, OFF_PARAM_GUARD);
     g_rt.orig_issen = RdI32(param, OFF_PARAM_ISSEN);
     g_rt.orig_grab  = RdI32(param, OFF_PARAM_GRAB);
     g_rt.orig_dodge = RdI32(param, OFF_PARAM_DODGE);
-    Log("[parry] adopted param %p: guard=%d issen=%d grab=%d dodge=%d",
-        param, g_rt.orig_guard, g_rt.orig_issen, g_rt.orig_grab, g_rt.orig_dodge);
+    Log("[parry] adopted param %p: g=%d i=%d gr=%d d=%d", param,
+        g_rt.orig_guard, g_rt.orig_issen, g_rt.orig_grab, g_rt.orig_dodge);
 }
 
 static void ApplyLockout() {
     if (!g_cfg.feat_lockout || !g_rt.jparam || !g_cfg.enabled) return;
-    for (auto& lf : kLockF) {
+    for (auto& lf : kLockF)
         if (*lf.target >= 0) SafeWrite<int32_t>(g_rt.jparam, lf.off, *lf.target);
-    }
 }
 
 // ─────────────────────────────────────────────────────────────
-// Original function pointers
+// Original pointers
 // ─────────────────────────────────────────────────────────────
 typedef void  (*LateUpdateFn)(void*);
 typedef void  (*CtrlUpdateFn)(void*, void*);
 typedef void  (*SelUpdateFn)(void*);
 typedef void  (*JFUUpdateFn)(void*);
 typedef float (*GetJustFrameFn)(void*, uint32_t, uint32_t, void*, void*);
-typedef bool  (*CheckMotion3Fn)(void*, void*, uint32_t);
+typedef bool  (*CheckMotion2Fn)(void*, uint32_t);
 
-static LateUpdateFn   o_LateUpdate  = nullptr;
-static CtrlUpdateFn   o_CtrlUpdate  = nullptr;
-static SelUpdateFn    o_SelUpdate   = nullptr;
-static JFUUpdateFn    o_JFUUpdate   = nullptr;
-static GetJustFrameFn o_GetJustFrame= nullptr;
-static CheckMotion3Fn o_PCCancel    = nullptr;
-static CheckMotion3Fn o_PCPreCancel = nullptr;
+static LateUpdateFn   o_LateUpdate   = nullptr;
+static CtrlUpdateFn   o_CtrlUpdate   = nullptr;
+static SelUpdateFn    o_SelUpdate    = nullptr;
+static JFUUpdateFn    o_JFUUpdate    = nullptr;
+static GetJustFrameFn o_GetJustFrame = nullptr;
+static CheckMotion2Fn o_PCCancel     = nullptr;
+static CheckMotion2Fn o_PCPreCancel  = nullptr;
 
-// ─────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────
 static bool ShouldOverride(uint32_t cmd) {
     if (!g_cfg.feat_wrappers || !g_cfg.enabled || g_rt.held) return false;
-    Cat c = CatOfCmd(cmd);
-    if (!g_cfg.cat[c]) return false;
-    return true;
+    return g_cfg.cat[CatOfCmd(cmd)];
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -491,7 +438,6 @@ static bool ShouldOverride(uint32_t cmd) {
 static void hk_LateUpdate(void* self) {
     g_rt.frame++;
 
-    // Hotkey F1 (edge-triggered)
     if (g_cfg.hotkey_f1) {
         bool down = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
         if (down && !g_rt.hotkey_prev) {
@@ -508,9 +454,16 @@ static void hk_LateUpdate(void* self) {
             g_rt.player = RdPtr(self, OFF_PACC_PC);
             g_rt.seq = nullptr;
             g_rt.layer_cache.clear();
-            Log("[state] entity=%p player=%p", pce, g_rt.player);
+            if (pce) Log("[state] entity=%p player=%p", pce, g_rt.player);
+        }
+        // Retry player resolution every 60 frames if missing
+        if (!g_rt.player && g_rt.frame - g_rt.last_entity_resolve > 60) {
+            g_rt.last_entity_resolve = g_rt.frame;
+            g_rt.player = RdPtr(self, OFF_PACC_PC);
+            if (g_rt.player) Log("[state] player resolved late: %p", g_rt.player);
         }
     }
+
     UpdateState();
     ForcePhases();
     o_LateUpdate(self);
@@ -529,15 +482,6 @@ static void hk_SelUpdate(void* self) {
     o_SelUpdate(self);
 }
 
-static bool hk_PCCancel(void* self, void* arg2, uint32_t cmd) {
-    bool orig = o_PCCancel(self, arg2, cmd);
-    return ShouldOverride(cmd) ? true : orig;
-}
-static bool hk_PCPreCancel(void* self, void* arg2, uint32_t cmd) {
-    bool orig = o_PCPreCancel(self, arg2, cmd);
-    return ShouldOverride(cmd) ? true : orig;
-}
-
 static void hk_JFUUpdate(void* self) {
     AdoptJFU(self);
     ApplyLockout();
@@ -546,7 +490,14 @@ static void hk_JFUUpdate(void* self) {
 
 static float hk_GetJustFrame(void* self, uint32_t type, uint32_t cat,
                               void* obj, void* rank) {
-    float orig = o_GetJustFrame(self, type, cat, obj, rank);
+    if (g_rt.gjf_calls < 5) {
+        Log("[gjf] call #%d self=%p type=%u cat=%u obj=%p rank=%p",
+            g_rt.gjf_calls, self, type, cat, obj, rank);
+        g_rt.gjf_calls++;
+    }
+    float orig = 0.0f;
+    __try { orig = o_GetJustFrame(self, type, cat, obj, rank); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0.0f; }
     if (!g_cfg.feat_window || !g_cfg.enabled || orig <= 0.0f) return orig;
     float m = 1.0f;
     switch (type) {
@@ -560,19 +511,30 @@ static float hk_GetJustFrame(void* self, uint32_t type, uint32_t cat,
     return (m == 1.0f) ? orig : orig * m;
 }
 
+static bool hk_PCCancel(void* self, uint32_t cmd) {
+    bool orig = o_PCCancel(self, cmd);
+    return ShouldOverride(cmd) ? true : orig;
+}
+static bool hk_PCPreCancel(void* self, uint32_t cmd) {
+    bool orig = o_PCPreCancel(self, cmd);
+    return ShouldOverride(cmd) ? true : orig;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Install
 // ─────────────────────────────────────────────────────────────
-struct HookInst { uintptr_t rva; void* fn; void** orig; const char* name; bool ok; };
+struct HookInst {
+    uintptr_t rva; void* fn; void** orig; const char* name;
+    bool* flag; bool optional; bool ok;
+};
 static HookInst g_hooks[] = {
-    { RVA_PACC_LATEUPDATE,  (void*)hk_LateUpdate,  (void**)&o_LateUpdate,  "PACC.lateUpdate",       true  },
-    { RVA_PCC_UPDATE,       (void*)hk_CtrlUpdate,  (void**)&o_CtrlUpdate,  "PCC.update",            true  },
-    { RVA_PAS_UPDATE,       (void*)hk_SelUpdate,   (void**)&o_SelUpdate,   "PAS.update",            true  },
-    { RVA_JFU_UPDATE,       (void*)hk_JFUUpdate,   (void**)&o_JFUUpdate,   "JFU.update",            true  },
-    { RVA_JFU_GETJUSTFRAME, (void*)hk_GetJustFrame,(void**)&o_GetJustFrame,"JFU.getJustFrame",      true  },
-    // Wrapper overrides: signature from CT, off by default (opt-in via ini)
-    { RVA_PCE_CHECKCANCEL_T,    (void*)hk_PCCancel,   (void**)&o_PCCancel,   "PCE.checkCancelMotion",    false },
-    { RVA_PCE_CHECKPRECANCEL_T, (void*)hk_PCPreCancel,(void**)&o_PCPreCancel,"PCE.checkPreCancelMotion", false },
+    { RVA_PACC_LATEUPDATE,  (void*)hk_LateUpdate,  (void**)&o_LateUpdate,  "PACC.lateUpdate",  &g_cfg.hook_late, false, false },
+    { RVA_PCC_UPDATE,       (void*)hk_CtrlUpdate,  (void**)&o_CtrlUpdate,  "PCC.update",       &g_cfg.hook_ctrl, false, false },
+    { RVA_PAS_UPDATE,       (void*)hk_SelUpdate,   (void**)&o_SelUpdate,   "PAS.update",       &g_cfg.hook_sel,  false, false },
+    { RVA_JFU_GETJUSTFRAME, (void*)hk_GetJustFrame,(void**)&o_GetJustFrame,"JFU.getJustFrame", &g_cfg.hook_gjf,  false, false },
+    { RVA_JFU_UPDATE,       (void*)hk_JFUUpdate,   (void**)&o_JFUUpdate,   "JFU.update",       nullptr,          false, false },
+    { RVA_PCE_CHECKCANCEL_T,(void*)hk_PCCancel,    (void**)&o_PCCancel,    "PCE.checkCancelMotion",    nullptr, true, false },
+    { RVA_PCE_CHECKPRECANCEL_T,(void*)hk_PCPreCancel,(void**)&o_PCPreCancel,"PCE.checkPreCancelMotion", nullptr, true, false },
 };
 static constexpr size_t kHookCount = sizeof(g_hooks) / sizeof(g_hooks[0]);
 
@@ -580,8 +542,12 @@ static int InstallAll() {
     if (MH_Initialize() != MH_OK) { Log("[-] MH_Initialize failed"); return 0; }
     int ok = 0;
     for (auto& h : g_hooks) {
-        if (h.name && strstr(h.name, "PCE.") && !g_cfg.feat_wrappers) {
-            Log("[i] skipping %s (WrapperOverrides=0)", h.name);
+        if (h.optional && !g_cfg.feat_wrappers) {
+            Log("[i] skip %s (WrapperOverrides=0)", h.name);
+            continue;
+        }
+        if (h.flag && !*h.flag) {
+            Log("[i] skip %s (hook flag off)", h.name);
             continue;
         }
         void* target = (void*)(kBase + h.rva);
@@ -589,7 +555,6 @@ static int InstallAll() {
         MH_STATUS s2 = (s1 == MH_OK) ? MH_EnableHook(target) : s1;
         if (s2 != MH_OK) {
             Log("[-] %s hook failed (%d)", h.name, (int)s2);
-            h.ok = false;
         } else {
             Log("[+] %s hooked @ 0x%llX", h.name, (unsigned long long)h.rva);
             h.ok = true;
@@ -600,19 +565,16 @@ static int InstallAll() {
 }
 
 static void UninstallAll() {
-    for (auto& h : g_hooks) {
-        if (h.ok) MH_DisableHook((void*)(kBase + h.rva));
-    }
+    for (auto& h : g_hooks) if (h.ok) MH_DisableHook((void*)(kBase + h.rva));
     MH_Uninitialize();
     Log("[i] hooks removed");
 }
 
 // ─────────────────────────────────────────────────────────────
-// Main thread
+// Main
 // ─────────────────────────────────────────────────────────────
 static DWORD WINAPI MainThread(LPVOID) {
     LoadConfig();
-
     for (int i = 0; i < 240; i++) {
         HMODULE mod = GetModuleHandleA("OnimushaWotS.exe");
         if (!mod) { Sleep(500); continue; }
@@ -638,8 +600,7 @@ static DWORD WINAPI MainThread(LPVOID) {
 BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(h);
-        char p[MAX_PATH];
-        GetModuleFileNameA(h, p, MAX_PATH);
+        char p[MAX_PATH]; GetModuleFileNameA(h, p, MAX_PATH);
         g_log_path = p;
         size_t s = g_log_path.find_last_of("\\/");
         g_log_path = (s == std::string::npos ? "" : g_log_path.substr(0, s + 1)) + "OnimushaMod_log.txt";
