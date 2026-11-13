@@ -1,6 +1,9 @@
-// Onimusha: Way of the Sword - standalone mod DLL.
-// v3: lateUpdate hook removed (was clobbering XMM/RDX), replaced by
-// getActionState + getCancelMotionSeq capture + ctrl/sel phase writes.
+// Onimusha: Way of the Sword - DUMP DLL (Strada C).
+// Read-only: hooks only observe, never write to game state.
+// Logs every state change: ACTION_STATE_BIT names, action vtable, cancel phases.
+// Goal: identify the real action object for attack_light / attack_hard /
+// dodge / guard / parry, and see whether the cancel phases are populated.
+//
 // Target: Steam 24769601 / 01.000.001, TimeDateStamp 0x6A827CEA,
 // SizeOfImage 0x249F0000, image base 0x140000000.
 
@@ -9,15 +12,12 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
-#include <cstdlib>
 #include <string>
 #include <vector>
 #include <unordered_map>
 
 #include "MinHook.h"
 
-// ─────────────────────────────────────────────────────────────
-// Build identity
 // ─────────────────────────────────────────────────────────────
 static constexpr DWORD     kTimestamp   = 0x6A827CEA;
 static constexpr DWORD     kSizeOfImage = 0x249F0000;
@@ -28,122 +28,124 @@ static constexpr uintptr_t kBase        = 0x140000000;
 // ─────────────────────────────────────────────────────────────
 static constexpr uintptr_t RVA_PCC_UPDATE           = 0x2015F0;
 static constexpr uintptr_t RVA_PAS_UPDATE           = 0x455340;
-static constexpr uintptr_t RVA_JFU_GETJUSTFRAME     = 0x9D7BB0;
 static constexpr uintptr_t RVA_CB_GETACTIONSTATE    = 0x49A1D10;
+static constexpr uintptr_t RVA_CB_GETBASEACTION     = 0x6669E30;
 static constexpr uintptr_t RVA_PCE_GETCANCELSEQ     = 0x6795B20;
-static constexpr uintptr_t RVA_JDS_ISACCEPTING      = 0x760A450;
 
 // ─────────────────────────────────────────────────────────────
 // Field offsets
 // ─────────────────────────────────────────────────────────────
 static constexpr uintptr_t OFF_CCCMD_PHASE  = 0x10;
 static constexpr uintptr_t OFF_PC_ENTITY    = 0x1F0;   // PlayerCharacter._PlayerCharacterEntity
-static constexpr uintptr_t OFF_PCM_MASKS    = 0x10;
-static constexpr uintptr_t OFF_BITSET_VALUE = 0x10;
 static constexpr uintptr_t OFF_PCE_SEQ      = 0x5B8;
-static constexpr uintptr_t OFF_PCE_JDS      = 0x3C8;
 static constexpr uintptr_t OFF_ARR_COUNT    = 0x1C;
 static constexpr uintptr_t OFF_ARR_DATA     = 0x20;
 
 // ─────────────────────────────────────────────────────────────
-// Command enum
+// ACTION_STATE_BIT names (from REFramework dump)
 // ─────────────────────────────────────────────────────────────
-enum Cmd : uint32_t {
-    CMD_ONI_CHANGE=0, CMD_ONI_EYE=1, CMD_PARRY=2, CMD_BLOCK=3, CMD_JUST_DODGE=4,
-    CMD_GRAB_COUNTER=5, CMD_ISSEN_COUNTER=6, CMD_ISSEN_BREAK=7, CMD_ISSEN_BLOCK=8,
-    CMD_ISSEN_CHAIN=9, CMD_GRAPPLE_BLOW=10, CMD_SKILL=11, CMD_SKILL_KEEP=12,
-    CMD_ULTIMATE=13, CMD_ABSORB=14, CMD_BOW=15, CMD_GUARD=16, CMD_ATTACK_BLOW=17,
-    CMD_DODGE=18, CMD_ATTACK_JUST_DODGE=19, CMD_ATTACK_SNEAK=20,
-    CMD_ATTACK_LIGHT_CHARGE=21, CMD_ATTACK_LIGHT_COMBO=22, CMD_ATTACK_LIGHT=23,
-    CMD_ATTACK_HARD_CHARGE=24, CMD_ATTACK_HARD_COMBO=25, CMD_ATTACK_HARD=26,
-    CMD_MEDICINE=27, CMD_ITEM=28, CMD_INTERACT=29, CMD_INTERACT_KEEP=30,
-    CMD_DASH=31, CMD_DASH_KEEP=32, CMD_RUN=33, CMD_RUN_TURN=34, CMD_WALK=35,
-    CMD_WALK_KEEP=36, CMD_WALK_STICK=37, CMD_QUICK_STOP=38, CMD_MENU_ITEM=39,
-    CMD_MENU_SKILL=40, CMD_LOCK_ON=41,
+struct StateBit { uint64_t mask; const char* name; };
+static const StateBit kStateBits[] = {
+    { 0x1ull,         "STAND" },
+    { 0x2ull,         "CROUCH" },
+    { 0x4ull,         "AIR" },
+    { 0x8ull,         "DOWN" },
+    { 0x10ull,        "WALL" },
+    { 0x20ull,        "WATER" },
+    { 0x40ull,        "DIVING" },
+    { 0x10000ull,     "IDLE" },
+    { 0x20000ull,     "MOVING" },
+    { 0x40000ull,     "ATTACK" },
+    { 0x80000ull,     "GRAPPLE" },
+    { 0x100000ull,    "DAMAGE" },
+    { 0x200000ull,    "SMASH" },
+    { 0x400000ull,    "BLOCKED" },
+    { 0x800000ull,    "PARRIED" },
+    { 0x1000000ull,   "GUARD_WAIT" },
+    { 0x2000000ull,   "GUARD_HIT" },
+    { 0x4000000ull,   "GUARD_BREAK" },
+    { 0x8000000ull,   "BLOCK" },
+    { 0x10000000ull,  "PARRY" },
+    { 0x20000000ull,  "EVADE" },
+    { 0x40000000ull,  "SHELL_ATTACK" },
+    { 0x80000000ull,  "ATEMI" },
+    { 0x100000000ull, "FEINT" },
+    { 0x200000000ull, "EM_GRAB" },
+    { 0x400000000ull, "EM_UNAVOIDABLE" },
+    { 0x800000000ull, "EM_ATTACK_AFTER_GRAPPLE" },
 };
+static constexpr size_t kStateBitsCount = sizeof(kStateBits) / sizeof(kStateBits[0]);
 
-static constexpr int      PHASE_ACTUAL    = 2;
-static constexpr uint64_t GRAPPLE_BIT     = 0x80000ull;
-static constexpr uint64_t DAMAGE_BIT      = 0x100000ull;
-static constexpr uint64_t SMASH_BIT       = 0x200000ull;
-static constexpr uint64_t BLOCKED_BIT     = 0x400000ull;
-static constexpr uint64_t ATTACK_BIT      = 0x40000ull;
-static constexpr uint64_t GUARD_BREAK_BIT = 0x4000000ull;
-static constexpr uint64_t BLOCK_BIT       = 0x8000000ull;
-static constexpr uint64_t PARRY_BIT       = 0x10000000ull;
-static constexpr uint64_t EVADE_BIT       = 0x20000000ull;
-static constexpr uint64_t HELD_MASK = GRAPPLE_BIT | DAMAGE_BIT | SMASH_BIT |
-    BLOCKED_BIT | GUARD_BREAK_BIT | BLOCK_BIT | PARRY_BIT;
-
-enum Cat { CAT_ATTACK, CAT_DODGE, CAT_GUARD, CAT_MOVE, CAT_ISSEN, CAT_OTHER, CAT_COUNT };
-static constexpr int CAT_NONE = -1;
-
-struct KeyDef { uint32_t cmd; uintptr_t offset; Cat cat; };
-static const KeyDef kKeys[] = {
-    { CMD_ONI_CHANGE, 0x50, CAT_OTHER },  { CMD_ONI_EYE, 0x58, CAT_OTHER },
-    { CMD_PARRY, 0x60, CAT_GUARD },       { CMD_BLOCK, 0x68, CAT_GUARD },
-    { CMD_JUST_DODGE, 0x70, CAT_DODGE },  { CMD_GRAB_COUNTER, 0x78, CAT_ISSEN },
-    { CMD_ISSEN_COUNTER, 0x80, CAT_ISSEN }, { CMD_ISSEN_BREAK, 0x88, CAT_ISSEN },
-    { CMD_ISSEN_BLOCK, 0x90, CAT_ISSEN }, { CMD_ISSEN_CHAIN, 0x98, CAT_ISSEN },
-    { CMD_GRAPPLE_BLOW, 0xA0, CAT_OTHER },{ CMD_SKILL, 0xA8, CAT_ATTACK },
-    { CMD_SKILL_KEEP, 0xB0, CAT_ATTACK }, { CMD_ULTIMATE, 0xB8, CAT_ATTACK },
-    { CMD_ABSORB, 0xC0, CAT_OTHER },      { CMD_BOW, 0xC8, CAT_ATTACK },
-    { CMD_GUARD, 0xD0, CAT_GUARD },       { CMD_ATTACK_BLOW, 0xD8, CAT_ATTACK },
-    { CMD_DODGE, 0xE0, CAT_DODGE },       { CMD_ATTACK_JUST_DODGE, 0xE8, CAT_DODGE },
-    { CMD_ATTACK_SNEAK, 0xF0, CAT_ATTACK },{ CMD_ATTACK_LIGHT_CHARGE, 0xF8, CAT_ATTACK },
-    { CMD_ATTACK_LIGHT_COMBO, 0x100, CAT_ATTACK },{ CMD_ATTACK_LIGHT, 0x108, CAT_ATTACK },
-    { CMD_ATTACK_HARD_CHARGE, 0x110, CAT_ATTACK },{ CMD_ATTACK_HARD_COMBO, 0x118, CAT_ATTACK },
-    { CMD_ATTACK_HARD, 0x120, CAT_ATTACK },{ CMD_MEDICINE, 0x128, CAT_OTHER },
-    { CMD_ITEM, 0x130, CAT_OTHER },       { CMD_INTERACT, 0x138, CAT_OTHER },
-    { CMD_INTERACT_KEEP, 0x140, CAT_OTHER },{ CMD_DASH, 0x148, CAT_MOVE },
-    { CMD_DASH_KEEP, 0x150, CAT_MOVE },   { CMD_RUN, 0x158, CAT_MOVE },
-    { CMD_RUN_TURN, 0x160, CAT_MOVE },    { CMD_WALK, 0x168, CAT_MOVE },
-    { CMD_WALK_KEEP, 0x170, CAT_MOVE },   { CMD_WALK_STICK, 0x178, CAT_MOVE },
-    { CMD_QUICK_STOP, 0x180, CAT_MOVE },  { CMD_MENU_ITEM, 0x188, CAT_OTHER },
-    { CMD_MENU_SKILL, 0x190, CAT_OTHER }, { CMD_LOCK_ON, 0x198, CAT_MOVE },
-};
-static constexpr size_t kKeysCount = sizeof(kKeys) / sizeof(kKeys[0]);
-
-static inline Cat CatOfCmd(uint32_t cmd) {
-    for (size_t i = 0; i < kKeysCount; i++) if (kKeys[i].cmd == cmd) return kKeys[i].cat;
-    return CAT_OTHER;
+static std::string StateStr(int64_t s) {
+    if (s == 0) return "NONE";
+    std::string r;
+    for (size_t i = 0; i < kStateBitsCount; i++) {
+        if (s & (int64_t)kStateBits[i].mask) {
+            if (!r.empty()) r += "|";
+            r += kStateBits[i].name;
+        }
+    }
+    return r.empty() ? "UNKNOWN" : r;
 }
 
 // ─────────────────────────────────────────────────────────────
-// Config
+// Cancel key names (from dump1)
+// ─────────────────────────────────────────────────────────────
+struct KeyName { uintptr_t offset; const char* name; };
+static const KeyName kKeyNames[] = {
+    { 0x50, "_OniChangeCancel" },          { 0x58, "_OniEyeSonerCancel" },
+    { 0x60, "_ParryCancel" },              { 0x68, "_BlockCancel" },
+    { 0x70, "_JustDodgeCancel" },          { 0x78, "_GrabCounterCancel" },
+    { 0x80, "_IssenCounterCancel" },       { 0x88, "_IssenBreakCancel" },
+    { 0x90, "_IssenBlockCancel" },         { 0x98, "_IssenChainCancel" },
+    { 0xA0, "_GrappleBlowCancel" },        { 0xA8, "_SkillCancel" },
+    { 0xB0, "_SkillKeepCancel" },          { 0xB8, "_UltimateAttackCancel" },
+    { 0xC0, "_AbsorbCancel" },             { 0xC8, "_BowCancel" },
+    { 0xD0, "_GuardCancel" },              { 0xD8, "_AttackBlowCancel" },
+    { 0xE0, "_DodgeCancel" },              { 0xE8, "_AttackJustDodgeCancel" },
+    { 0xF0, "_AttackSneakCancel" },        { 0xF8, "_AttackLightChargeCancel" },
+    { 0x100, "_AttackLightComboCancel" },  { 0x108, "_AttackLightCancel" },
+    { 0x110, "_AttackHardChargeCancel" },  { 0x118, "_AttackHardComboCancel" },
+    { 0x120, "_AttackHardCancel" },        { 0x128, "_MedicineCancel" },
+    { 0x130, "_ItemCancel" },              { 0x138, "_InteractCancel" },
+    { 0x140, "_InteractKeepCancel" },      { 0x148, "_DashCancel" },
+    { 0x150, "_DashKeepCancel" },          { 0x158, "_RunCancel" },
+    { 0x160, "_RunTurnCancel" },           { 0x168, "_WalkCancel" },
+    { 0x170, "_WalkKeepCancel" },          { 0x178, "_WalkStickCancel" },
+    { 0x180, "_QuickStopCancel" },         { 0x188, "_MenuItemCancel" },
+    { 0x190, "_MenuSkillCancel" },         { 0x198, "_LockOnCancel" },
+};
+static constexpr size_t kKeysCount = sizeof(kKeyNames) / sizeof(kKeyNames[0]);
+
 // ─────────────────────────────────────────────────────────────
 struct Config {
     bool enabled = true;
-    bool cat[CAT_COUNT] = { true, true, true, false, false, false };
-    float wm_guard = 1.0f, wm_issen = 1.0f, wm_grab = 1.0f, wm_dodge = 1.0f;
-    bool feat_phase = true, feat_mask = true,
-         feat_window = true, feat_reflex = true;
-    bool log_on = true, hotkey_f1 = true, hotkey_f2 = true;
+    bool log_on = true;
+    bool hotkey_f1 = true;
+    int  log_every_frames = 60;    // 1 summary per second at 60fps
 } g_cfg;
-static Config g_cfg_prev;
 
+// ─────────────────────────────────────────────────────────────
 struct RuntimeState {
     void*    entity = nullptr;
     void*    player = nullptr;
     void*    seq = nullptr;
     uint32_t seq_count = 0;
-    std::unordered_map<uintptr_t, std::vector<std::pair<void*, Cat>>> layer_cache;
-    int64_t  state = 0;
-    bool     jd_open = false, held = false;
-    int      skip_cat = CAT_NONE;
-    uint64_t frame = 0, state_frame = (uint64_t)-1;
-    bool     f1_prev = false, f2_prev = false;
-    int      hook_entries[4] = {0,0,0,0};
-    bool     gjc_disabled = false;
+    void*    last_action = nullptr;
+    uintptr_t last_vtable = 0;
+    int64_t  last_state = 0;
+    bool     last_held = false;
+    uint64_t frame = 0;
+    uint64_t last_summary = 0;
+    bool     f1_prev = false;
+    std::unordered_map<uintptr_t, bool> layer_seen;
 } g_rt;
 
-// ─────────────────────────────────────────────────────────────
-// Log
 // ─────────────────────────────────────────────────────────────
 static std::string g_log_path;
 static void Log(const char* fmt, ...) {
     if (!g_cfg.log_on) return;
-    char msg[512];
+    char msg[1024];
     va_list ap; va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
@@ -156,16 +158,9 @@ static void Log(const char* fmt, ...) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Safe memory
-// ─────────────────────────────────────────────────────────────
 template<typename T>
 static bool SafeRead(void* base, uintptr_t off, T& out) {
     __try { out = *(T*)((uintptr_t)base + off); return true; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
-template<typename T>
-static bool SafeWrite(void* base, uintptr_t off, T v) {
-    __try { *(T*)((uintptr_t)base + off) = v; return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 static inline void* RdPtr(void* b, uintptr_t o) {
@@ -174,9 +169,12 @@ static inline void* RdPtr(void* b, uintptr_t o) {
 static inline int32_t RdI32(void* b, uintptr_t o, int32_t d = 0) {
     int32_t v = d; return SafeRead(b, o, v) ? v : d;
 }
+static inline uintptr_t RdUP(void* b, uintptr_t o, uintptr_t d = 0) {
+    uintptr_t v = d; return SafeRead(b, o, v) ? v : d;
+}
 
 // ─────────────────────────────────────────────────────────────
-// Config
+// INI loader (idempotent, F2 reloads)
 // ─────────────────────────────────────────────────────────────
 static std::string g_ini_path;
 static void LoadConfig(bool initial) {
@@ -188,77 +186,56 @@ static void LoadConfig(bool initial) {
         g_ini_path = (d == std::string::npos) ? s + ".ini" : s.substr(0, d) + ".ini";
     }
     const char* ini = g_ini_path.c_str();
-    auto I = [&](const char* s, const char* k, int d) {
-        return (int)GetPrivateProfileIntA(s, k, d, ini);
-    };
-    auto F = [&](const char* s, const char* k, float d) {
-        char b[64]; GetPrivateProfileStringA(s, k, "", b, sizeof(b), ini);
-        return b[0] ? (float)atof(b) : d;
-    };
-    if (!initial) g_cfg_prev = g_cfg;
-    g_cfg.enabled         = I("AnimationCancel", "Enabled", 1) != 0;
-    g_cfg.cat[CAT_ATTACK] = I("AnimationCancel", "Attacks", 1) != 0;
-    g_cfg.cat[CAT_DODGE]  = I("AnimationCancel", "Dodge",   1) != 0;
-    g_cfg.cat[CAT_GUARD]  = I("AnimationCancel", "Guard",   1) != 0;
-    g_cfg.cat[CAT_MOVE]   = I("AnimationCancel", "Move",    0) != 0;
-    g_cfg.cat[CAT_ISSEN]  = I("AnimationCancel", "Issen",   0) != 0;
-    g_cfg.cat[CAT_OTHER]  = I("AnimationCancel", "Other",   0) != 0;
-    g_cfg.wm_guard        = F("InstantParry", "GuardWindow", 1.0f);
-    g_cfg.wm_issen        = F("InstantParry", "IssenWindow", 1.0f);
-    g_cfg.wm_grab         = F("InstantParry", "GrabWindow", 1.0f);
-    g_cfg.wm_dodge        = F("InstantParry", "DodgeWindow", 1.0f);
-    g_cfg.feat_phase      = I("Features", "PhaseWrites", 1) != 0;
-    g_cfg.feat_mask       = I("Features", "MaskClearing", 1) != 0;
-    g_cfg.feat_window     = I("Features", "WindowMultiplier", 1) != 0;
-    g_cfg.feat_reflex     = I("Features", "ReflexHold", 1) != 0;
-    g_cfg.log_on          = I("Debug", "Log", 1) != 0;
-    g_cfg.hotkey_f1       = I("Debug", "HotkeyF1", 1) != 0;
-    g_cfg.hotkey_f2       = I("Debug", "HotkeyF2", 1) != 0;
-    if (initial) {
-        Log("[cfg] enabled=%d cats a=%d d=%d g=%d m=%d i=%d o=%d",
-            g_cfg.enabled, g_cfg.cat[0], g_cfg.cat[1], g_cfg.cat[2],
-            g_cfg.cat[3], g_cfg.cat[4], g_cfg.cat[5]);
-        Log("[cfg] features phase=%d mask=%d window=%d reflex=%d",
-            g_cfg.feat_phase, g_cfg.feat_mask, g_cfg.feat_window, g_cfg.feat_reflex);
-    } else {
-        Log("[cfg] reload complete (F2)");
-    }
+    g_cfg.enabled          = GetPrivateProfileIntA("Dump", "Enabled", 1, ini) != 0;
+    g_cfg.log_on           = GetPrivateProfileIntA("Debug", "Log", 1, ini) != 0;
+    g_cfg.hotkey_f1        = GetPrivateProfileIntA("Debug", "HotkeyF1", 1, ini) != 0;
+    g_cfg.log_every_frames = GetPrivateProfileIntA("Dump", "LogEveryFrames", 60, ini);
+    if (initial) Log("[cfg] dump enabled=%d log_every=%d", g_cfg.enabled, g_cfg.log_every_frames);
+    else Log("[cfg] reload complete (F2)");
 }
 
 // ─────────────────────────────────────────────────────────────
-// Game calls
+// Game method wrappers (read-only, SEH-guarded)
 // ─────────────────────────────────────────────────────────────
 typedef int64_t (*GetStateFn)(void*);
+typedef void*   (*GetBaseActionFn)(void*);
 typedef void*   (*GetSeqFn)(void*);
-typedef bool    (*JDAcceptFn)(void*);
 typedef void    (*CtrlUpFn)(void*, void*);
 typedef void    (*SelUpFn)(void*);
-typedef float   (*GJFFn)(void*, uint32_t, uint32_t, void*, void*);
 
-static GetStateFn o_GetState = nullptr;
-static GetSeqFn   o_GetSeq   = nullptr;
-static JDAcceptFn o_JDAccept = nullptr;
-static CtrlUpFn   o_CtrlUp   = nullptr;
-static SelUpFn    o_SelUp    = nullptr;
-static GJFFn      o_GJF      = nullptr;
+static GetStateFn     o_GetState = nullptr;
+static GetBaseActionFn o_GetBaseAction = nullptr;
+static GetSeqFn       o_GetSeq   = nullptr;
+static CtrlUpFn       o_CtrlUp   = nullptr;
+static SelUpFn        o_SelUp    = nullptr;
 
-static int64_t CallGetState(void* player) {
-    if (!player || !o_GetState) return 0;
-    __try { return o_GetState(player); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
-}
-static bool CallJDAccept(void* jds) {
-    if (!jds || g_rt.gjc_disabled || !o_JDAccept) return false;
-    __try { return o_JDAccept(jds); }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        g_rt.gjc_disabled = true;
-        Log("[crash] isJDAccepting crashed -> disabled");
-        return false;
+// ─────────────────────────────────────────────────────────────
+// Layer / key dump helpers
+// ─────────────────────────────────────────────────────────────
+static void DumpLayerPhases(void* layer, uint32_t idx) {
+    if (!layer) return;
+    std::string line;
+    int nonzero = 0;
+    for (const auto& kn : kKeyNames) {
+        void* key_obj = RdPtr(layer, kn.offset);
+        if (!key_obj) continue;
+        int32_t phase = RdI32(key_obj, OFF_CCCMD_PHASE, -1);
+        if (phase < 0) continue;
+        if (phase != 0) {
+            if (!line.empty()) line += " ";
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%s=%d", kn.name + 1, phase);   // strip leading _
+            line += buf;
+            nonzero++;
+        }
+    }
+    if (nonzero > 0) {
+        Log("[phases] L%u %p nonNONE(%d): %s", idx, layer, nonzero, line.c_str());
+    } else {
+        Log("[phases] L%u %p all NONE", idx, layer);
     }
 }
 
-// ─────────────────────────────────────────────────────────────
-// State
-// ─────────────────────────────────────────────────────────────
 static void RefreshSeq() {
     if (!g_rt.entity) { g_rt.seq = nullptr; g_rt.seq_count = 0; return; }
     void* seq = RdPtr(g_rt.entity, OFF_PCE_SEQ);
@@ -268,145 +245,97 @@ static void RefreshSeq() {
     if (seq == g_rt.seq) return;
     g_rt.seq = seq;
     g_rt.seq_count = 0;
-    g_rt.layer_cache.clear();
+    g_rt.layer_seen.clear();
     int32_t cnt = RdI32(seq, OFF_ARR_COUNT);
     if (cnt > 0 && cnt < 128) g_rt.seq_count = (uint32_t)cnt;
-    Log("[state] seq=%p layers=%u", seq, g_rt.seq_count);
-}
-
-static void UpdateState() {
-    if (g_rt.state_frame == g_rt.frame) return;
-    g_rt.state_frame = g_rt.frame;
-    if (!g_cfg.enabled) return;
-    if (g_cfg.feat_phase) RefreshSeq();
-    if (g_rt.frame % 600 == 0) { g_rt.seq = nullptr; g_rt.layer_cache.clear(); }
-    g_rt.state = CallGetState(g_rt.player);
-    g_rt.jd_open = g_cfg.feat_reflex && (g_rt.state & EVADE_BIT) != 0
-        && CallJDAccept(RdPtr(g_rt.entity, OFF_PCE_JDS));
-    bool held = (g_rt.state & HELD_MASK) != 0 || g_rt.jd_open;
-    if (held != g_rt.held) {
-        Log("[state] held=%d state=0x%llX", held, (unsigned long long)g_rt.state);
-        g_rt.held = held;
-    }
-    if      (g_rt.state & ATTACK_BIT) g_rt.skip_cat = CAT_ATTACK;
-    else if (g_rt.state & EVADE_BIT)  g_rt.skip_cat = CAT_DODGE;
-    else if (g_rt.state & (BLOCK_BIT | PARRY_BIT)) g_rt.skip_cat = CAT_GUARD;
-    else                               g_rt.skip_cat = CAT_NONE;
+    Log("[seq] changed -> %p layers=%u", seq, g_rt.seq_count);
 }
 
 // ─────────────────────────────────────────────────────────────
-// Phase writes
+// Hooks (read-only)
 // ─────────────────────────────────────────────────────────────
-static void ForcePhases() {
-    if (!g_cfg.feat_phase || !g_rt.seq || !g_cfg.enabled || g_rt.held) return;
-    for (uint32_t i = 0; i < g_rt.seq_count; i++) {
-        void* layer = nullptr;
-        if (!SafeRead((void*)((uintptr_t)g_rt.seq + OFF_ARR_DATA + 8 * i), 0, layer)) break;
-        if (!layer) continue;
-        auto it = g_rt.layer_cache.find((uintptr_t)layer);
-        if (it == g_rt.layer_cache.end()) {
-            std::vector<std::pair<void*, Cat>> keys;
-            for (const auto& kd : kKeys) {
-                void* ko = RdPtr(layer, kd.offset);
-                if (ko) keys.push_back({ ko, kd.cat });
-            }
-            it = g_rt.layer_cache.emplace((uintptr_t)layer, std::move(keys)).first;
-            Log("[phases] cached layer %p with %zu keys", layer, it->second.size());
-        }
-        for (auto& k : it->second) {
-            if (!g_cfg.cat[k.second]) continue;
-            if (g_rt.skip_cat == (int)k.second) continue;
-            SafeWrite<int32_t>(k.first, OFF_CCCMD_PHASE, PHASE_ACTUAL);
-        }
-    }
-}
 
-static void Unmask(void* mask_obj) {
-    if (!g_cfg.feat_mask || !mask_obj || !g_cfg.enabled || g_rt.held) return;
-    bool in_combat = (g_rt.state & (ATTACK_BIT | EVADE_BIT | BLOCK_BIT | PARRY_BIT)) != 0;
-    if (!in_combat) return;
-    void* bitset = RdPtr(mask_obj, OFF_PCM_MASKS);
-    if (!bitset) return;
-    void* arr = RdPtr(bitset, OFF_BITSET_VALUE);
-    if (!arr) return;
-    int32_t nwords = RdI32(arr, OFF_ARR_COUNT);
-    if (nwords <= 0 || nwords > 8) return;
-    uint32_t* words = (uint32_t*)((uintptr_t)arr + OFF_ARR_DATA);
-    for (const auto& kd : kKeys) {
-        if (!g_cfg.cat[kd.cat]) continue;
-        if (g_rt.skip_cat == (int)kd.cat) continue;
-        uint32_t w = kd.cmd >> 5, bit = 1u << (kd.cmd & 31);
-        if (w < (uint32_t)nwords) {
-            __try { words[w] &= ~bit; } __except (EXCEPTION_EXECUTE_HANDLER) {}
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────
-// Hooks
-// ─────────────────────────────────────────────────────────────
-// Capture player from getActionState(this=player). Signature: int64_t(this).
+// getActionState(this=player) -> int64_t
 static int64_t hk_GetState(void* player) {
+    int64_t s = 0;
+    if (o_GetState) { __try { s = o_GetState(player); } __except (EXCEPTION_EXECUTE_HANDLER) { s = 0; } }
     if (player && !g_rt.player) {
         g_rt.player = player;
         g_rt.entity = RdPtr(player, OFF_PC_ENTITY);
         Log("[capture] player=%p entity=%p", player, g_rt.entity);
     }
-    if (!o_GetState) return 0;
-    __try { return o_GetState(player); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return s;
 }
 
-// Capture entity from getCancelMotionSeq(this=entity). Signature: void*(this).
+// get_BaseCurrentAction(this=player) -> action*
+static void* hk_GetBaseAction(void* self) {
+    void* action = nullptr;
+    if (o_GetBaseAction) {
+        __try { action = o_GetBaseAction(self); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    if (action && action != g_rt.last_action) {
+        uintptr_t vtbl = RdUP(action, 0);
+        g_rt.last_action = action;
+        g_rt.last_vtable = vtbl;
+        Log("[action] ptr=%p vtable=0x%llX", action, (unsigned long long)vtbl);
+    }
+    return action;
+}
+
+// getCancelMotionSeq(this=entity) -> seq*
 static void* hk_GetSeq(void* entity) {
+    void* seq = nullptr;
+    if (o_GetSeq) { __try { seq = o_GetSeq(entity); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
     if (entity && !g_rt.entity) {
         g_rt.entity = entity;
         Log("[capture] entity=%p (from getCancelMotionSeq)", entity);
     }
-    if (!o_GetSeq) return nullptr;
-    __try { return o_GetSeq(entity); } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    return seq;
 }
 
+// ctrlUpdate(this, mask) - dump summary
 static void hk_CtrlUp(void* self, void* mask) {
     g_rt.frame++;
-    if (g_rt.hook_entries[0]++ < 3) Log("[hook] ctrl #%d", g_rt.hook_entries[0]);
-    if (g_cfg.hotkey_f1) {
+    if (g_rt.hotkey_f1) {
         bool d = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
-        if (d && !g_rt.f1_prev) { g_cfg.enabled = !g_cfg.enabled; Log("[hotkey] F1 -> %d", g_cfg.enabled); }
+        if (d && !g_rt.f1_prev) { g_cfg.enabled = !g_cfg.enabled; Log("[hotkey] F1 -> dump=%d", g_cfg.enabled); }
         g_rt.f1_prev = d;
     }
-    if (g_cfg.hotkey_f2) {
-        bool d = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
-        if (d && !g_rt.f2_prev) { Log("[hotkey] F2 reload"); LoadConfig(false); }
-        g_rt.f2_prev = d;
+    if (g_rt.enabled) {
+        // call getActionState directly if we have player
+        int64_t s = 0;
+        if (g_rt.player && o_GetState) {
+            __try { s = o_GetState(g_rt.player); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        // log on state change
+        if (s != g_rt.last_state) {
+            Log("[state] 0x%llX %s", (unsigned long long)s, StateStr(s).c_str());
+            g_rt.last_state = s;
+            // on every state change, dump phase keys of all layers
+            RefreshSeq();
+            if (g_rt.seq && g_rt.seq_count > 0) {
+                for (uint32_t i = 0; i < g_rt.seq_count; i++) {
+                    void* layer = nullptr;
+                    __try { layer = *(void**)((uintptr_t)g_rt.seq + OFF_ARR_DATA + 8 * i); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+                    if (layer) DumpLayerPhases(layer, i);
+                }
+            }
+        }
+        // periodic summary
+        if (g_rt.frame - g_rt.last_summary >= (uint64_t)g_cfg.log_every_frames) {
+            g_rt.last_summary = g_rt.frame;
+            Log("[summary] frame=%llu state=0x%llX action=%p vtbl=0x%llX seq_layers=%u",
+                (unsigned long long)g_rt.frame,
+                (unsigned long long)s, g_rt.last_action,
+                (unsigned long long)g_rt.last_vtable, g_rt.seq_count);
+        }
     }
-    UpdateState();
-    ForcePhases();
-    Unmask(mask);
     if (o_CtrlUp) { __try { o_CtrlUp(self, mask); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
 }
 
 static void hk_SelUp(void* self) {
-    if (g_rt.hook_entries[1]++ < 3) Log("[hook] sel #%d", g_rt.hook_entries[1]);
-    UpdateState();
-    ForcePhases();
     if (o_SelUp) { __try { o_SelUp(self); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
-}
-
-static float hk_GJF(void* self, uint32_t type, uint32_t cat, void* obj, void* rank) {
-    if (g_rt.hook_entries[2]++ < 5) Log("[hook] gjf #%d type=%u cat=%u", g_rt.hook_entries[2], type, cat);
-    float orig = 0.0f;
-    if (o_GJF) { __try { orig = o_GJF(self, type, cat, obj, rank); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0.0f; } }
-    if (!g_cfg.feat_window || !g_cfg.enabled || orig <= 0.0f) return orig;
-    float m = 1.0f;
-    switch (type) {
-        case 0: m = g_cfg.wm_issen; break;
-        case 1: m = g_cfg.wm_grab;  break;
-        case 2: m = g_cfg.wm_guard; break;
-        case 3: m = g_cfg.wm_guard; break;
-        case 4: m = g_cfg.wm_dodge; break;
-        default: return orig;
-    }
-    return (m == 1.0f) ? orig : orig * m;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -416,11 +345,11 @@ struct HookInst {
     uintptr_t rva; void* fn; void** orig; const char* name; bool ok;
 };
 static HookInst g_hooks[] = {
-    { RVA_PCC_UPDATE,        (void*)hk_CtrlUp,   (void**)&o_CtrlUp,   "PCC.update",             false },
-    { RVA_PAS_UPDATE,        (void*)hk_SelUp,    (void**)&o_SelUp,    "PAS.update",             false },
-    { RVA_JFU_GETJUSTFRAME,  (void*)hk_GJF,      (void**)&o_GJF,      "JFU.getJustFrame",       false },
-    { RVA_CB_GETACTIONSTATE, (void*)hk_GetState, (void**)&o_GetState, "CharacterBase.getActionState", false },
-    { RVA_PCE_GETCANCELSEQ,  (void*)hk_GetSeq,   (void**)&o_GetSeq,   "PCE.getCancelMotionSeq", false },
+    { RVA_CB_GETACTIONSTATE, (void*)hk_GetState,      (void**)&o_GetState,      "CharacterBase.getActionState",   false },
+    { RVA_CB_GETBASEACTION,  (void*)hk_GetBaseAction, (void**)&o_GetBaseAction, "CharacterBase.get_BaseCurrentAction", false },
+    { RVA_PCE_GETCANCELSEQ,  (void*)hk_GetSeq,        (void**)&o_GetSeq,        "PCE.getCancelMotionSeq",         false },
+    { RVA_PCC_UPDATE,        (void*)hk_CtrlUp,        (void**)&o_CtrlUp,        "PCC.update",                     false },
+    { RVA_PAS_UPDATE,        (void*)hk_SelUp,         (void**)&o_SelUp,         "PAS.update",                     false },
 };
 
 static int InstallAll() {
@@ -442,8 +371,6 @@ static void UninstallAll() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Main
-// ─────────────────────────────────────────────────────────────
 static DWORD WINAPI MainThread(LPVOID) {
     LoadConfig(true);
     for (int i = 0; i < 240; i++) {
@@ -460,7 +387,7 @@ static DWORD WINAPI MainThread(LPVOID) {
         Log("[+] build verified: %p", mod);
         int n = InstallAll();
         if (n == 0) { Log("[-] no hooks"); return 0; }
-        Log("[+] ready (%d hooks). F1=toggle, F2=reload.", n);
+        Log("[+] DUMP READY (%d hooks). Play: light attack x3, hard attack, dodge, guard, parry.", n);
         return 0;
     }
     Log("[-] game not found");
