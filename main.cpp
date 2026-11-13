@@ -1,236 +1,510 @@
-// Shadow of War (ShadowOfWar.exe, x64) - single-player mod DLL
-// Port of SeiKur0's Cheat Engine table (v21) to a native DLL.
-//
-// Standalone: only the DLL is needed. No INI, no log, no dump files are created
-// unless built with -DSOW_ENABLE_FILES=ON (debug aid). Settings are the constants
-// in kConfig below (change them in source and rebuild).
-//
-// Features (default ON):
-//   - Uruk spawn rarity      (legendary / epic)
-//   - Get all Uruk intel
-//   - Choose multiple skills
-//   - Infinite mission time
-//   - Forced drop            (Epic/Legendary Uruks always drop the NemesisGear
-//                             entry named in kConfig.dropItem; off when empty)
-//
-// Every site is found by AOB scan and byte-verified before it is touched.
-// Inject after the game has started (any injector).
+// Onimusha: Way of the Sword - standalone mod DLL.
+// Combines animation_cancel.lua + instant_parry.lua.
+// Target: Steam 24769601 / 01.000.001, TimeDateStamp 0x6A827CEA, SizeOfImage 0x249F0000.
 
 #include <windows.h>
+#include <cstdint>
 #include <cstdio>
 #include <cstdarg>
+#include <cstring>
+#include <cstdlib>
 #include <string>
-#include "aob_scan.h"
-#include "gamedb.h"
-#include "stubs.h"
+#include <vector>
+#include <unordered_map>
+#include "MinHook.h"
 
-static HMODULE     g_self = nullptr;
-static std::string g_dir;                 // folder of this DLL, trailing slash
+// ─── Build identity ────────────────────────────────────────
+static constexpr DWORD     kTimestamp   = 0x6A827CEA;
+static constexpr DWORD     kSizeOfImage = 0x249F0000;
+static constexpr uintptr_t kBase        = 0x140000000;
 
-struct Config {
-    bool rarity = true, legendary = true;
-    bool intel = true, skills = true, missionTime = true;
-    bool dumpDrops = true;
-    std::string dropItem;
+// ─── RVAs (from REFramework dump: absolute - 0x140000000) ──
+static constexpr uintptr_t RVA_PACC_LATEUPDATE      = 0x49A55A0;
+static constexpr uintptr_t RVA_PCC_UPDATE           = 0x2015F0;
+static constexpr uintptr_t RVA_PAS_UPDATE           = 0x455340;
+static constexpr uintptr_t RVA_PCE_CHECKCANCEL_T    = 0x4B23C10;
+static constexpr uintptr_t RVA_PCE_CHECKPRECANCEL_T = 0x4B23C50;
+static constexpr uintptr_t RVA_PCE_CHECKIGNORE      = 0x50040E0;
+static constexpr uintptr_t RVA_PU_CHECKCANCEL_T     = 0x4B93580;
+static constexpr uintptr_t RVA_PU_CHECKPRECANCEL_T  = 0x7938030;
+static constexpr uintptr_t RVA_JFU_UPDATE           = 0x40D950;
+static constexpr uintptr_t RVA_JFU_GETJUSTFRAME     = 0x5101170;
+static constexpr uintptr_t RVA_CB_GETACTIONSTATE    = 0x49A1D10;
+static constexpr uintptr_t RVA_JDS_ISACCEPTING      = 0x760A450;
+
+// ─── Field offsets ────────────────────────────────────────
+static constexpr uintptr_t OFF_CCCMD_PHASE   = 0x10;   // cCancelCommand._Phase
+static constexpr uintptr_t OFF_PACC_PCE      = 0x60;   // PlayerActionCancelChecker._PlayerCharacterEntity
+static constexpr uintptr_t OFF_PACC_PC       = 0x58;   // PlayerActionCancelChecker._PlayerCharacter
+static constexpr uintptr_t OFF_PCM_MASKS     = 0x10;   // cPlayerCommandMask._CommandMasks
+static constexpr uintptr_t OFF_BITSET_VALUE  = 0x10;   // ace.Bitset._Value
+static constexpr uintptr_t OFF_PCE_SEQ       = 0x5B8;  // PCE._PlayerCommandCancelMotionSeq
+static constexpr uintptr_t OFF_PCE_JDS       = 0x3C8;  // PCE.JustDodgeSupporter
+static constexpr uintptr_t OFF_JFU_PARAM     = 0x38;   // JFU._JustActionParam
+static constexpr uintptr_t OFF_PARAM_GUARD   = 0xC8;
+static constexpr uintptr_t OFF_PARAM_ISSEN   = 0xCC;
+static constexpr uintptr_t OFF_PARAM_GRAB    = 0xD8;
+static constexpr uintptr_t OFF_PARAM_DODGE   = 0xDC;
+static constexpr uintptr_t OFF_ARR_COUNT     = 0x1C;   // managed array: element count
+static constexpr uintptr_t OFF_ARR_DATA      = 0x20;   // managed array: first element
+
+// ─── Constants ────────────────────────────────────────────
+static constexpr int      PHASE_ACTUAL     = 2;
+static constexpr uint64_t GRAPPLE_BIT      = 0x80000ull;
+static constexpr uint64_t ATTACK_BIT       = 0x40000ull;
+static constexpr uint64_t DAMAGE_BIT       = 0x100000ull;
+static constexpr uint64_t SMASH_BIT        = 0x200000ull;
+static constexpr uint64_t BLOCKED_BIT      = 0x400000ull;
+static constexpr uint64_t GUARD_BREAK_BIT  = 0x4000000ull;
+static constexpr uint64_t BLOCK_BIT        = 0x8000000ull;
+static constexpr uint64_t PARRY_BIT        = 0x10000000ull;
+static constexpr uint64_t EVADE_BIT        = 0x20000000ull;
+
+// ─── Command enum (from dump) ─────────────────────────────
+enum Cmd : uint32_t {
+    CMD_ONI_CHANGE=0, CMD_ONI_EYE=1, CMD_PARRY=2, CMD_BLOCK=3, CMD_JUST_DODGE=4,
+    CMD_GRAB_COUNTER=5, CMD_ISSEN_COUNTER=6, CMD_ISSEN_BREAK=7, CMD_ISSEN_BLOCK=8,
+    CMD_ISSEN_CHAIN=9, CMD_GRAPPLE_BLOW=10, CMD_SKILL=11, CMD_SKILL_KEEP=12,
+    CMD_ULTIMATE=13, CMD_ABSORB=14, CMD_BOW=15, CMD_GUARD=16, CMD_ATTACK_BLOW=17,
+    CMD_DODGE=18, CMD_ATTACK_JUST_DODGE=19, CMD_ATTACK_SNEAK=20,
+    CMD_ATTACK_LIGHT_CHARGE=21, CMD_ATTACK_LIGHT_COMBO=22, CMD_ATTACK_LIGHT=23,
+    CMD_ATTACK_HARD_CHARGE=24, CMD_ATTACK_HARD_COMBO=25, CMD_ATTACK_HARD=26,
+    CMD_MEDICINE=27, CMD_ITEM=28, CMD_INTERACT=29, CMD_INTERACT_KEEP=30,
+    CMD_DASH=31, CMD_DASH_KEEP=32, CMD_RUN=33, CMD_RUN_TURN=34, CMD_WALK=35,
+    CMD_WALK_KEEP=36, CMD_WALK_STICK=37, CMD_QUICK_STOP=38, CMD_MENU_ITEM=39,
+    CMD_MENU_SKILL=40, CMD_LOCK_ON=41,
 };
 
+enum Cat { CAT_ATTACK, CAT_DODGE, CAT_GUARD, CAT_MOVE, CAT_ISSEN, CAT_OTHER, CAT_COUNT };
+
+struct KeyDef { uint32_t cmd; uintptr_t offset; Cat cat; };
+static const KeyDef kKeys[] = {
+    { CMD_ONI_CHANGE,         0x50,  CAT_OTHER  },
+    { CMD_ONI_EYE,            0x58,  CAT_OTHER  },
+    { CMD_PARRY,              0x60,  CAT_GUARD  },
+    { CMD_BLOCK,              0x68,  CAT_GUARD  },
+    { CMD_JUST_DODGE,         0x70,  CAT_DODGE  },
+    { CMD_GRAB_COUNTER,       0x78,  CAT_ISSEN  },
+    { CMD_ISSEN_COUNTER,      0x80,  CAT_ISSEN  },
+    { CMD_ISSEN_BREAK,        0x88,  CAT_ISSEN  },
+    { CMD_ISSEN_BLOCK,        0x90,  CAT_ISSEN  },
+    { CMD_ISSEN_CHAIN,        0x98,  CAT_ISSEN  },
+    { CMD_GRAPPLE_BLOW,       0xA0,  CAT_OTHER  },
+    { CMD_SKILL,              0xA8,  CAT_ATTACK },
+    { CMD_SKILL_KEEP,         0xB0,  CAT_ATTACK },
+    { CMD_ULTIMATE,           0xB8,  CAT_ATTACK },
+    { CMD_ABSORB,             0xC0,  CAT_OTHER  },
+    { CMD_BOW,                0xC8,  CAT_ATTACK },
+    { CMD_GUARD,              0xD0,  CAT_GUARD  },
+    { CMD_ATTACK_BLOW,        0xD8,  CAT_ATTACK },
+    { CMD_DODGE,              0xE0,  CAT_DODGE  },
+    { CMD_ATTACK_JUST_DODGE,  0xE8,  CAT_DODGE  },  // dodge per Lua classify order
+    { CMD_ATTACK_SNEAK,       0xF0,  CAT_ATTACK },
+    { CMD_ATTACK_LIGHT_CHARGE,0xF8,  CAT_ATTACK },
+    { CMD_ATTACK_LIGHT_COMBO, 0x100, CAT_ATTACK },
+    { CMD_ATTACK_LIGHT,       0x108, CAT_ATTACK },
+    { CMD_ATTACK_HARD_CHARGE, 0x110, CAT_ATTACK },
+    { CMD_ATTACK_HARD_COMBO,  0x118, CAT_ATTACK },
+    { CMD_ATTACK_HARD,        0x120, CAT_ATTACK },
+    { CMD_MEDICINE,           0x128, CAT_OTHER  },
+    { CMD_ITEM,               0x130, CAT_OTHER  },
+    { CMD_INTERACT,           0x138, CAT_OTHER  },
+    { CMD_INTERACT_KEEP,      0x140, CAT_OTHER  },
+    { CMD_DASH,               0x148, CAT_MOVE   },
+    { CMD_DASH_KEEP,          0x150, CAT_MOVE   },
+    { CMD_RUN,                0x158, CAT_MOVE   },
+    { CMD_RUN_TURN,           0x160, CAT_MOVE   },
+    { CMD_WALK,               0x168, CAT_MOVE   },
+    { CMD_WALK_KEEP,          0x170, CAT_MOVE   },
+    { CMD_WALK_STICK,         0x178, CAT_MOVE   },
+    { CMD_QUICK_STOP,         0x180, CAT_MOVE   },
+    { CMD_MENU_ITEM,          0x188, CAT_OTHER  },
+    { CMD_MENU_SKILL,         0x190, CAT_OTHER  },
+    { CMD_LOCK_ON,            0x198, CAT_MOVE   },
+};
+static constexpr size_t kKeysCount = sizeof(kKeys) / sizeof(kKeys[0]);
+
+static inline Cat CatOfCmd(uint32_t cmd) {
+    for (size_t i = 0; i < kKeysCount; i++) if (kKeys[i].cmd == cmd) return kKeys[i].cat;
+    return CAT_OTHER;
+}
+
+// ─── Config ───────────────────────────────────────────────
+struct Config {
+    bool enabled = false;
+    bool cat[CAT_COUNT] = { false, false, false, false, false, false };
+    int  lock_guard = 0, lock_issen = -1, lock_grab = -1, lock_dodge = -1;
+    float wm_guard = 1.0f, wm_issen = 1.0f, wm_grab = 1.0f, wm_dodge = 1.0f;
+    bool log_on = true;
+} g_cfg;
+
+// ─── Runtime state ────────────────────────────────────────
+struct LayerKeys { void* key_obj; uintptr_t offset; Cat cat; };
+struct RuntimeState {
+    void*    entity = nullptr;
+    void*    player = nullptr;
+    void*    seq = nullptr;
+    uint32_t seq_count = 0;
+    std::unordered_map<uintptr_t, std::vector<LayerKeys>> layer_cache;
+    void*    jfu = nullptr;
+    void*    jparam = nullptr;
+    int      orig_guard = -1, orig_issen = -1, orig_grab = -1, orig_dodge = -1;
+    bool     jd_open = false;
+    bool     held = false;
+    uint64_t frame = 0;
+    uint64_t state_frame = 0;
+    uint64_t frame_seen = 0;
+} g_rt;
+
+// ─── Logging ──────────────────────────────────────────────
+static std::string g_log_path;
 static void Log(const char* fmt, ...) {
-#ifdef SOW_ENABLE_FILES
+    if (!g_cfg.log_on) return;
     char msg[512];
     va_list ap; va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    FILE* f = fopen((g_dir + "ShadowOfWarMod_log.txt").c_str(), "a");
+    FILE* f = fopen(g_log_path.c_str(), "a");
     if (!f) return;
     SYSTEMTIME st; GetLocalTime(&st);
-    fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, msg);
+    fprintf(f, "[%02d:%02d:%02d.%03d] %s\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
     fclose(f);
-#else
-    (void)fmt;
-#endif
 }
 
-// Built-in settings (no INI). Edit and rebuild to change.
-static const Config kConfig = [] {
-    Config c;
-    c.rarity      = true;     // Uruk spawn rarity hook
-    c.legendary   = true;     // true = legendary, false = epic
-    c.intel       = true;     // all Uruk intel
-    c.skills      = true;     // choose multiple skills
-    c.missionTime = true;     // infinite mission time
-    c.dropItem    = "";       // NemesisGear entry id to always drop ("" = off)
-#ifdef SOW_ENABLE_FILES
-    c.dumpDrops   = true;     // writes ShadowOfWarMod_drops.txt (debug build only)
-#else
-    c.dumpDrops   = false;
-#endif
-    return c;
-}();
+// ─── Safe memory read ─────────────────────────────────────
+template<typename T> static inline T Rd(void* base, uintptr_t off) {
+    return *(T*)((uintptr_t)base + off);
+}
+template<typename T> static inline void Wr(void* base, uintptr_t off, T v) {
+    *(T*)((uintptr_t)base + off) = v;
+}
 
-// ---------------------------------------------------------------------------
-// jmp-hook through a near trampoline:  site: E9 rel32 (+nops) -> tramp:
-//   FF 25 00000000 <abs64 stub>  -> stub ... jmp [ret slot] -> site+len
-// ---------------------------------------------------------------------------
-static uint8_t* g_tramp = nullptr;
-static size_t   g_trampUsed = 0;
+// ─── Config loader ────────────────────────────────────────
+static void LoadConfig() {
+    char path[MAX_PATH];
+    HMODULE self = GetModuleHandleA("OnimushaMod.dll");
+    if (!self) self = GetModuleHandleA(nullptr);
+    GetModuleFileNameA(self, path, MAX_PATH);
+    std::string ini = path;
+    auto dot = ini.find_last_of('.');
+    ini = (dot == std::string::npos) ? ini + ".ini" : ini.substr(0, dot) + ".ini";
 
-static bool InstallHook(HMODULE mod, const char* name, uint8_t* site, size_t len,
-                        void* stub, uint64_t* retSlot) {
-    if (len < 5 || len > 16) return false;
-    if (!g_tramp) {
-        g_tramp = AllocNearModule(mod, 0x1000);
-        if (!g_tramp) { Log("[-] %s: no free memory near the module for the trampoline", name); return false; }
+    auto I = [&](const char* s, const char* k, int def) {
+        return (int)GetPrivateProfileIntA(s, k, def, ini.c_str());
+    };
+    auto F = [&](const char* s, const char* k, float def) {
+        char buf[64]; GetPrivateProfileStringA(s, k, "", buf, sizeof(buf), ini.c_str());
+        if (!buf[0]) return def;
+        return (float)atof(buf);
+    };
+    g_cfg.enabled       = I("AnimationCancel", "Enabled", 0) != 0;
+    g_cfg.cat[CAT_ATTACK] = I("AnimationCancel", "Attacks", 0) != 0;
+    g_cfg.cat[CAT_DODGE]  = I("AnimationCancel", "Dodge",   0) != 0;
+    g_cfg.cat[CAT_GUARD]  = I("AnimationCancel", "Guard",   0) != 0;
+    g_cfg.cat[CAT_MOVE]   = I("AnimationCancel", "Move",    0) != 0;
+    g_cfg.cat[CAT_ISSEN]  = I("AnimationCancel", "Issen",   0) != 0;
+    g_cfg.cat[CAT_OTHER]  = I("AnimationCancel", "Other",   0) != 0;
+    g_cfg.lock_guard = I("InstantParry", "GuardLockout", 0);
+    g_cfg.lock_issen = I("InstantParry", "IssenLockout", -1);
+    g_cfg.lock_grab  = I("InstantParry", "GrabLockout", -1);
+    g_cfg.lock_dodge = I("InstantParry", "DodgeLockout", -1);
+    g_cfg.wm_guard   = F("InstantParry", "GuardWindow", 1.0f);
+    g_cfg.wm_issen   = F("InstantParry", "IssenWindow", 1.0f);
+    g_cfg.wm_grab    = F("InstantParry", "GrabWindow", 1.0f);
+    g_cfg.wm_dodge   = F("InstantParry", "DodgeWindow", 1.0f);
+    g_cfg.log_on     = I("Debug", "Log", 1) != 0;
+
+    Log("[cfg] enabled=%d atk=%d ddg=%d grd=%d mv=%d isn=%d oth=%d lock(g%d i%d gr%d d%d)",
+        g_cfg.enabled, g_cfg.cat[0], g_cfg.cat[1], g_cfg.cat[2], g_cfg.cat[3], g_cfg.cat[4], g_cfg.cat[5],
+        g_cfg.lock_guard, g_cfg.lock_issen, g_cfg.lock_grab, g_cfg.lock_dodge);
+}
+
+// ─── State update (once per frame) ────────────────────────
+static int64_t GetActionState() {
+    if (!g_rt.player) return 0;
+    typedef int64_t(*Fn)(void*);
+    auto fn = (Fn)(kBase + RVA_CB_GETACTIONSTATE);
+    __try { return fn(g_rt.player); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+static bool IsJDWindowOpen() {
+    if (!g_rt.entity) return false;
+    void* jds = Rd<void*>(g_rt.entity, OFF_PCE_JDS);
+    if (!jds) return false;
+    typedef bool(*Fn)(void*);
+    auto fn = (Fn)(kBase + RVA_JDS_ISACCEPTING);
+    __try { return fn(jds); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static void RefreshSeq() {
+    if (!g_rt.entity) return;
+    void* seq = Rd<void*>(g_rt.entity, OFF_PCE_SEQ);
+    if (seq == g_rt.seq) return;
+    g_rt.seq = seq;
+    g_rt.seq_count = 0;
+    g_rt.layer_cache.clear();
+    if (seq) {
+        int32_t cnt = Rd<int32_t>(seq, OFF_ARR_COUNT);
+        if (cnt > 0 && cnt < 128) g_rt.seq_count = (uint32_t)cnt;
     }
-    uint8_t* t = g_tramp + g_trampUsed;
-    int64_t rel = (int64_t)(t - (site + 5));
-    if (rel > INT32_MAX || rel < INT32_MIN) { Log("[-] %s: trampoline out of rel32 range", name); return false; }
-
-    t[0] = 0xFF; t[1] = 0x25; *(uint32_t*)(t + 2) = 0; *(uint64_t*)(t + 6) = (uint64_t)stub;
-    g_trampUsed += 16;
-
-    *retSlot = (uint64_t)(site + len);                    // must be valid before the jmp goes live
-    uint8_t patch[16];
-    memset(patch, 0x90, sizeof(patch));
-    patch[0] = 0xE9; *(int32_t*)(patch + 1) = (int32_t)rel;
-    if (!WriteCode(site, patch, len)) { Log("[-] %s: VirtualProtect/write failed", name); return false; }
-    Log("[+] %s: hooked @ module+0x%llX", name, (unsigned long long)(site - (uint8_t*)mod));
-    return true;
+    Log("[state] seq=%p layers=%u", seq, g_rt.seq_count);
 }
 
-static bool PatchBytesAt(HMODULE mod, const char* name, uint8_t* site, const uint8_t* now,
-                         const uint8_t* neu, size_t n) {
-    if (!BytesEqual(site, now, n)) { Log("[-] %s: bytes at site differ from expected - skipped", name); return false; }
-    if (!WriteCode(site, neu, n))  { Log("[-] %s: write failed", name); return false; }
-    Log("[+] %s: patched @ module+0x%llX", name, (unsigned long long)(site - (uint8_t*)mod));
-    return true;
+static void UpdateState() {
+    if (g_rt.state_frame == g_rt.frame) return;
+    g_rt.state_frame = g_rt.frame;
+    if (!g_cfg.enabled) return;
+
+    RefreshSeq();
+    int64_t state = GetActionState();
+
+    g_rt.jd_open = IsJDWindowOpen();
+    bool synced = (state & GRAPPLE_BIT) != 0;
+    bool parry  = (state & (PARRY_BIT | BLOCK_BIT)) != 0;
+    bool damage = (state & (DAMAGE_BIT | SMASH_BIT | BLOCKED_BIT | GUARD_BREAK_BIT)) != 0;
+
+    bool held_new = synced || parry || damage || g_rt.jd_open;
+    if (held_new != g_rt.held) {
+        Log("[state] held=%d (sync=%d parry=%d damage=%d jd=%d)",
+            held_new, synced, parry, damage, g_rt.jd_open);
+    }
+    g_rt.held = held_new;
 }
 
-// ---------------------------------------------------------------------------
-// Features
-// ---------------------------------------------------------------------------
-static bool ApplyRarity(HMODULE mod, bool legendary) {
-    static const uint8_t prologue[] = { 0x57, 0x48, 0x83, 0xEC, 0x60 };            // push rdi; sub rsp,60
-    static const uint8_t before[]   = { 0x48, 0x83, 0x64, 0x24, 0x28, 0x00 };      // and qword [rsp+28],0
-    uint8_t* hit = FindPatternVerified(mod, "48 8D 4C 24 ?? 0F 57 C0 33 DB", true, [&](uint8_t* h) {
-        return BytesEqual(h - 0x1E, prologue, sizeof(prologue)) && BytesEqual(h - 6, before, sizeof(before));
-    });
-    if (!hit) return false;
-    g_rarityLegendary = legendary ? 1 : 0;
-    return InstallHook(mod, "uruk_spawn_rarity", hit - 0x1E, 5, (void*)&SowRarityStub, &ret_rarity);
-}
-
-static bool ApplyIntel(HMODULE mod) {
-    static const uint8_t orig[] = { 0xBA, 0x03, 0x00, 0x00, 0x00 };                // mov edx,3
-    uint8_t* hit = FindPatternVerified(mod, "B0 01 EB ?? 48 8D 8B ?? ?? ?? ?? BA 03", true, [&](uint8_t* h) {
-        return BytesEqual(h + 0xB, orig, sizeof(orig));
-    });
-    if (!hit) return false;
-    return InstallHook(mod, "all_uruk_intel", hit + 0xB, 5, (void*)&SowIntelStub, &ret_intel);
-}
-
-static bool ApplySkills(HMODULE mod) {
-    uint8_t* hit = FindPatternInModule(mod,
-        "74 ?? 48 8B ?? 40 04 00 00 48 85 ?? 74 ?? 4C 39 ?? 40 74 ?? ?? ?? ?? ?? ?? ?? ?? ?? 08 00 00 00");
-    if (!hit) return false;
-    const uint8_t now[] = { 0x74 }, neu[] = { 0xEB };                              // je -> jmp
-    return PatchBytesAt(mod, "choose_multiple_skills", hit, now, neu, 1);
-}
-
-static bool ApplyMissionTime(HMODULE mod) {
-    uint8_t* hit = FindPatternInModule(mod, "48 8D 59 10 48 8B F9 48 8B CB E8 ?? ?? ?? ?? 84 C0 0F 85");
-    if (!hit) return false;
-    const uint8_t now[] = { 0x84, 0xC0 }, neu[] = { 0xEB, 0x06 };                  // test al,al -> jmp +6
-    return PatchBytesAt(mod, "infinite_mission_time", hit + 0xF, now, neu, 2);
-}
-
-// returns true when finished (success OR permanent failure), false = retry later
-static bool ApplyDrops(HMODULE mod, const Config& cfg) {
-#ifdef SOW_ENABLE_FILES
-    static bool dumped = false;
-#endif
-    uintptr_t list = 0;
-    uintptr_t db = FindGameDb(mod, "Faction/Loot/NemesisGear", list);
-    if (!db) return false;                                  // gamedb not loaded yet
-
-#ifdef SOW_ENABLE_FILES
-    if (cfg.dumpDrops && !dumped) {
-        std::string txt = DbDumpList(list);
-        FILE* f = fopen((g_dir + "ShadowOfWarMod_drops.txt").c_str(), "w");
-        if (f) {
-            fprintf(f, "# Faction/Loot/NemesisGear  (index<TAB>id) - put an id in [Drops] ItemId\n%s", txt.c_str());
-            fclose(f);
+// ─── Force phases (animation_cancel core) ─────────────────
+static void ForcePhases() {
+    if (!g_rt.seq || !g_cfg.enabled) return;
+    if (g_rt.held) return;
+    uintptr_t* arr = (uintptr_t*)g_rt.seq;
+    for (uint32_t i = 0; i < g_rt.seq_count; i++) {
+        void* layer = (void*)arr[OFF_ARR_DATA / 8 + i];
+        if (!layer) continue;
+        auto it = g_rt.layer_cache.find((uintptr_t)layer);
+        if (it == g_rt.layer_cache.end()) {
+            std::vector<LayerKeys> keys;
+            keys.reserve(kKeysCount);
+            for (const auto& kd : kKeys) {
+                void* ko = Rd<void*>(layer, kd.offset);
+                if (ko) keys.push_back({ ko, kd.offset, kd.cat });
+            }
+            it = g_rt.layer_cache.emplace((uintptr_t)layer, std::move(keys)).first;
+            Log("[phases] cached layer %p with %zu keys", layer, it->second.size());
         }
-        Log("[i] drop list dumped (%zu bytes) -> ShadowOfWarMod_drops.txt", txt.size());
-        dumped = true;
+        for (auto& k : it->second) {
+            if (!g_cfg.cat[k.cat]) continue;
+            Wr<int32_t>(k.key_obj, OFF_CCCMD_PHASE, PHASE_ACTUAL);
+        }
     }
-#endif
-    if (cfg.dropItem.empty()) { Log("[i] dropItem empty - forced drop not installed"); return true; }
-
-    uintptr_t entry = DbEntryBase(list, cfg.dropItem);
-    if (!entry) { Log("[-] drop item '%s' not found in NemesisGear - check the dump file", cfg.dropItem.c_str()); return true; }
-
-    static const uint8_t orig[] = { 0x48, 0x8B, 0xD8, 0x48, 0x85, 0xC0 };          // mov rbx,rax; test rax,rax
-    uint8_t* hit = FindPatternVerified(mod,
-        "48 8D 4C 24 ?? 49 8B D4 E8 ?? ?? ?? ?? 48 8B D8 48 85 C0 74", true, [&](uint8_t* h) {
-            return BytesEqual(h + 0xD, orig, sizeof(orig));
-        });
-    if (!hit) return false;
-    g_lootNemGear = (uint64_t)list;
-    g_dropItem    = (uint64_t)entry;
-    if (!InstallHook(mod, "forced_drop", hit + 0xD, 6, (void*)&SowDropStub, &ret_drop)) {
-        g_dropItem = 0;
-        return true;
-    }
-    Log("[+] forced drop item '%s' @ 0x%llX", cfg.dropItem.c_str(), (unsigned long long)entry);
-    return true;
 }
 
+// ─── Mask clearing ────────────────────────────────────────
+static void Unmask(void* mask_obj) {
+    if (!mask_obj || !g_cfg.enabled || g_rt.held) return;
+    bool any = false;
+    for (int i = 0; i < CAT_COUNT; i++) if (g_cfg.cat[i]) any = true;
+    if (!any) return;
+    void* bitset = Rd<void*>(mask_obj, OFF_PCM_MASKS);
+    if (!bitset) return;
+    void* arr = Rd<void*>(bitset, OFF_BITSET_VALUE);
+    if (!arr) return;
+    int32_t nwords = Rd<int32_t>(arr, OFF_ARR_COUNT);
+    if (nwords <= 0 || nwords > 8) return;
+    uint32_t* words = (uint32_t*)((uintptr_t)arr + OFF_ARR_DATA);
+    for (const auto& kd : kKeys) {
+        if (!g_cfg.cat[kd.cat]) continue;
+        uint32_t w = kd.cmd >> 5;
+        uint32_t bit = 1u << (kd.cmd & 31);
+        if (w < (uint32_t)nwords) words[w] &= ~bit;
+    }
+}
+
+// ─── Lockout override ─────────────────────────────────────
+struct LockF { uintptr_t offset; int* target; };
+static LockF kLockF[] = {
+    { OFF_PARAM_GUARD, &g_cfg.lock_guard },
+    { OFF_PARAM_ISSEN, &g_cfg.lock_issen },
+    { OFF_PARAM_GRAB,  &g_cfg.lock_grab  },
+    { OFF_PARAM_DODGE, &g_cfg.lock_dodge },
+};
+
+static void AdoptJFU(void* jfu) {
+    if (jfu == g_rt.jfu) return;
+    g_rt.jfu = jfu;
+    void* param = Rd<void*>(jfu, OFF_JFU_PARAM);
+    if (param == g_rt.jparam) return;
+    g_rt.jparam = param;
+    if (param) {
+        g_rt.orig_guard = Rd<int32_t>(param, OFF_PARAM_GUARD);
+        g_rt.orig_issen = Rd<int32_t>(param, OFF_PARAM_ISSEN);
+        g_rt.orig_grab  = Rd<int32_t>(param, OFF_PARAM_GRAB);
+        g_rt.orig_dodge = Rd<int32_t>(param, OFF_PARAM_DODGE);
+        Log("[parry] adopted param %p: guard=%d issen=%d grab=%d dodge=%d",
+            param, g_rt.orig_guard, g_rt.orig_issen, g_rt.orig_grab, g_rt.orig_dodge);
+    }
+}
+
+static void ApplyLockout() {
+    if (!g_rt.jparam) return;
+    for (int i = 0; i < 4; i++) {
+        if (*kLockF[i].target >= 0) Wr<int32_t>(g_rt.jparam, kLockF[i].offset, *kLockF[i].target);
+    }
+}
+
+// ─── Original function pointers ───────────────────────────
+typedef void    (*LateUpdateFn)(void*);
+typedef void    (*CtrlUpdateFn)(void*, void*);
+typedef void    (*SelUpdateFn)(void*);
+typedef bool    (*CheckMotionFn)(void*, uint32_t);
+typedef void    (*JFUUpdateFn)(void*);
+typedef float   (*GetJustFrameFn)(void*, uint32_t, uint32_t, void*, void*);
+
+static LateUpdateFn   o_LateUpdate = nullptr;
+static CtrlUpdateFn   o_CtrlUpdate = nullptr;
+static SelUpdateFn    o_SelUpdate  = nullptr;
+static CheckMotionFn  o_PCCancel   = nullptr;
+static CheckMotionFn  o_PCPreCancel= nullptr;
+static CheckMotionFn  o_PCIgnore   = nullptr;
+static CheckMotionFn  o_PUCancel   = nullptr;
+static CheckMotionFn  o_PUPreCancel= nullptr;
+static JFUUpdateFn    o_JFUUpdate  = nullptr;
+static GetJustFrameFn o_GetJustFrame= nullptr;
+
+// ─── Helpers ──────────────────────────────────────────────
+static bool ShouldOverride(uint32_t cmd) {
+    if (!g_cfg.enabled || g_rt.held) return false;
+    Cat c = CatOfCmd(cmd);
+    return g_cfg.cat[c];
+}
+
+// ─── Hook implementations ─────────────────────────────────
+static void hk_LateUpdate(void* self) {
+    g_rt.frame++;
+    if (self) {
+        void* pce = Rd<void*>(self, OFF_PACC_PCE);
+        if (pce != g_rt.entity) {
+            g_rt.entity = pce;
+            g_rt.player = Rd<void*>(self, OFF_PACC_PC);
+            Log("[state] entity=%p player=%p", pce, g_rt.player);
+        }
+    }
+    UpdateState();
+    ForcePhases();
+    o_LateUpdate(self);
+}
+
+static void hk_CtrlUpdate(void* self, void* mask) {
+    UpdateState();
+    ForcePhases();
+    Unmask(mask);
+    o_CtrlUpdate(self, mask);
+}
+
+static void hk_SelUpdate(void* self) {
+    UpdateState();
+    ForcePhases();
+    o_SelUpdate(self);
+}
+
+static bool hk_PCCancel(void* self, uint32_t cmd) {
+    bool orig = o_PCCancel(self, cmd);
+    return ShouldOverride(cmd) ? true : orig;
+}
+static bool hk_PCPreCancel(void* self, uint32_t cmd) {
+    bool orig = o_PCPreCancel(self, cmd);
+    return ShouldOverride(cmd) ? true : orig;
+}
+static bool hk_PCIgnore(void* self, uint32_t cmd) {
+    bool orig = o_PCIgnore(self, cmd);
+    return ShouldOverride(cmd) ? false : orig;
+}
+static bool hk_PUCancel(void* self, uint32_t cmd) {
+    bool orig = o_PUCancel(self, cmd);
+    return ShouldOverride(cmd) ? true : orig;
+}
+static bool hk_PUPreCancel(void* self, uint32_t cmd) {
+    bool orig = o_PUPreCancel(self, cmd);
+    return ShouldOverride(cmd) ? true : orig;
+}
+
+static void hk_JFUUpdate(void* self) {
+    AdoptJFU(self);
+    ApplyLockout();
+    o_JFUUpdate(self);
+}
+
+static float hk_GetJustFrame(void* self, uint32_t type, uint32_t cat,
+                             void* gameObj, void* rank) {
+    float orig = o_GetJustFrame(self, type, cat, gameObj, rank);
+    if (!g_cfg.enabled || orig <= 0.0f) return orig;
+    float m = 1.0f;
+    switch (type) {
+        case 0: m = g_cfg.wm_issen; break;
+        case 1: m = g_cfg.wm_grab;  break;
+        case 2: m = g_cfg.wm_guard; break;
+        case 3: m = g_cfg.wm_guard; break;
+        case 4: m = g_cfg.wm_dodge; break;
+        default: return orig;
+    }
+    return (m == 1.0f) ? orig : orig * m;
+}
+
+// ─── Install ──────────────────────────────────────────────
+static bool InstallAll() {
+    if (MH_Initialize() != MH_OK) { Log("[-] MH_Initialize failed"); return false; }
+    auto H = [](uintptr_t rva, void* fn, void** orig, const char* name) {
+        void* target = (void*)(kBase + rva);
+        MH_STATUS s1 = MH_CreateHook(target, fn, orig);
+        MH_STATUS s2 = (s1 == MH_OK) ? MH_EnableHook(target) : s1;
+        if (s2 != MH_OK) { Log("[-] %s hook failed (%d)", name, (int)s2); return false; }
+        Log("[+] %s hooked @ 0x%llX", name, (unsigned long long)rva);
+        return true;
+    };
+    return
+        H(RVA_PACC_LATEUPDATE,      (void*)hk_LateUpdate,   (void**)&o_LateUpdate,    "PACC.lateUpdate") &&
+        H(RVA_PCC_UPDATE,           (void*)hk_CtrlUpdate,   (void**)&o_CtrlUpdate,    "PCC.update") &&
+        H(RVA_PAS_UPDATE,           (void*)hk_SelUpdate,    (void**)&o_SelUpdate,     "PAS.update") &&
+        H(RVA_PCE_CHECKCANCEL_T,    (void*)hk_PCCancel,     (void**)&o_PCCancel,      "PCE.checkCancelMotion") &&
+        H(RVA_PCE_CHECKPRECANCEL_T, (void*)hk_PCPreCancel,  (void**)&o_PCPreCancel,   "PCE.checkPreCancelMotion") &&
+        H(RVA_PCE_CHECKIGNORE,      (void*)hk_PCIgnore,     (void**)&o_PCIgnore,      "PCE.checkIgnoreMotion") &&
+        H(RVA_PU_CHECKCANCEL_T,     (void*)hk_PUCancel,     (void**)&o_PUCancel,      "PU.checkCancelMotion") &&
+        H(RVA_PU_CHECKPRECANCEL_T,  (void*)hk_PUPreCancel,  (void**)&o_PUPreCancel,   "PU.checkPreCancelMotion") &&
+        H(RVA_JFU_UPDATE,           (void*)hk_JFUUpdate,    (void**)&o_JFUUpdate,     "JFU.update") &&
+        H(RVA_JFU_GETJUSTFRAME,     (void*)hk_GetJustFrame, (void**)&o_GetJustFrame,  "JFU.getJustFrame");
+}
+
+// ─── Entry ────────────────────────────────────────────────
 static DWORD WINAPI MainThread(LPVOID) {
-    const Config& cfg = kConfig;
-    Log("[i] ShadowOfWarMod started (rarity=%d/%s intel=%d skills=%d time=%d drop='%s')",
-        cfg.rarity, cfg.legendary ? "legendary" : "epic", cfg.intel, cfg.skills, cfg.missionTime,
-        cfg.dropItem.c_str());
-
-    HMODULE mod = nullptr;
-    for (int i = 0; i < 240 && !mod; ++i) {
-        mod = GetModuleHandleA("ShadowOfWar.exe");
-        if (!mod) Sleep(500);
+    LoadConfig();
+    for (int i = 0; i < 240; i++) {
+        HMODULE mod = GetModuleHandleA("OnimushaWotS.exe");
+        if (!mod) { Sleep(500); continue; }
+        auto* dos = (IMAGE_DOS_HEADER*)mod;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+        auto* nt = (IMAGE_NT_HEADERS*)((uintptr_t)mod + dos->e_lfanew);
+        if (nt->FileHeader.TimeDateStamp != kTimestamp ||
+            nt->OptionalHeader.SizeOfImage != kSizeOfImage) {
+            Log("[-] unsupported build (ts=%08X so=%08X)",
+                nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage);
+            return 0;
+        }
+        Log("[+] build verified: %p", mod);
+        if (!InstallAll()) { Log("[-] install failed"); return 0; }
+        Log("[+] ready");
+        return 0;
     }
-    if (!mod) { Log("[-] ShadowOfWar.exe not found in this process - wrong target?"); return 0; }
-    Log("[i] module base=0x%p", (void*)mod);
-
-    bool dRarity = !cfg.rarity, dIntel = !cfg.intel, dSkills = !cfg.skills, dTime = !cfg.missionTime;
-    bool dDrops = !cfg.dumpDrops && cfg.dropItem.empty();
-
-    const int maxTries = 300;                                // ~5 min, covers slow game start
-    for (int t = 0; t < maxTries; ++t) {
-        if (!dRarity) dRarity = ApplyRarity(mod, cfg.legendary);
-        if (!dIntel)  dIntel  = ApplyIntel(mod);
-        if (!dSkills) dSkills = ApplySkills(mod);
-        if (!dTime)   dTime   = ApplyMissionTime(mod);
-        if (!dDrops)  dDrops  = ApplyDrops(mod, cfg);
-        if (dRarity && dIntel && dSkills && dTime && dDrops) break;
-        Sleep(1000);
-    }
-    if (!dRarity) Log("[-] uruk_spawn_rarity: AOB not found (game version mismatch?)");
-    if (!dIntel)  Log("[-] all_uruk_intel: AOB not found (game version mismatch?)");
-    if (!dSkills) Log("[-] choose_multiple_skills: AOB not found (game version mismatch?)");
-    if (!dTime)   Log("[-] infinite_mission_time: AOB not found (game version mismatch?)");
-    if (!dDrops)  Log("[-] drops: gamedb or hook AOB not found");
-    Log("[i] done.");
+    Log("[-] OnimushaWotS.exe not found");
     return 0;
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(hModule);
-        g_self = hModule;
-        char path[MAX_PATH];
-        GetModuleFileNameA(hModule, path, MAX_PATH);
-        g_dir = path;
-        size_t pos = g_dir.find_last_of("\\/");
-        g_dir = (pos == std::string::npos) ? "" : g_dir.substr(0, pos + 1);
+        DisableThreadLibraryCalls(h);
+        char p[MAX_PATH];
+        GetModuleFileNameA(h, p, MAX_PATH);
+        g_log_path = p;
+        size_t s = g_log_path.find_last_of("\\/");
+        g_log_path = (s == std::string::npos ? "" : g_log_path.substr(0, s + 1)) + "OnimushaMod_log.txt";
         CreateThread(nullptr, 0, MainThread, nullptr, 0, nullptr);
     }
     return TRUE;
