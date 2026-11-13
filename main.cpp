@@ -1,5 +1,5 @@
 // Onimusha: Way of the Sword - standalone mod DLL.
-// Defensive build: SEH around all game calls + crash-once-then-disable.
+// Defensive build: SEH around all game calls + crash-once-then-disable + F2 reload.
 // Target: Steam 24769601 / 01.000.001, TimeDateStamp 0x6A827CEA,
 // SizeOfImage 0x249F0000, image base 0x140000000.
 
@@ -132,10 +132,13 @@ struct Config {
     bool feat_phase = true, feat_mask = true, feat_lockout = true,
          feat_window = true, feat_reflex = true, feat_wrappers = false;
     bool hook_late = true, hook_ctrl = true, hook_sel = true, hook_gjf = true;
-    bool safe_mode = true;     // DEFAULT ON: no game function calls
+    bool safe_mode = true;
     bool log_on = true;
     bool hotkey_f1 = true;
+    bool hotkey_f2 = true;
 } g_cfg;
+
+static Config g_cfg_prev;   // snapshot for diff logging on reload
 
 // ─────────────────────────────────────────────────────────────
 // Runtime state
@@ -157,16 +160,16 @@ struct RuntimeState {
     int      skip_cat = CAT_NONE;
     uint64_t frame = 0;
     uint64_t state_frame = (uint64_t)-1;
-    uint64_t hotkey_prev = 0;
+    bool     f1_prev = false;
+    bool     f2_prev = false;
     int      gjf_calls = 0;
     uint64_t last_entity_resolve = 0;
 
-    // Crash guards
     bool player_invalid = false;
     bool gjc_disabled = false;
     bool o_late_crashed = false, o_ctrl_crashed = false,
          o_sel_crashed = false, o_gjf_crashed = false;
-    int  hook_entries[4] = {0,0,0,0};   // late, ctrl, sel, gjf
+    int  hook_entries[4] = {0,0,0,0};
 } g_rt;
 
 // ─────────────────────────────────────────────────────────────
@@ -208,24 +211,33 @@ static inline int32_t RdI32(void* base, uintptr_t off, int32_t d = 0) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Config loader
+// Config loader (idempotent, callable on F2)
 // ─────────────────────────────────────────────────────────────
-static void LoadConfig() {
-    char path[MAX_PATH];
-    HMODULE self = GetModuleHandleA("OnimushaMod.dll");
-    if (!self) self = GetModuleHandleA(nullptr);
-    GetModuleFileNameA(self, path, MAX_PATH);
-    std::string ini = path;
-    auto dot = ini.find_last_of('.');
-    ini = (dot == std::string::npos) ? ini + ".ini" : ini.substr(0, dot) + ".ini";
+static std::string g_ini_path;
+
+static void LoadConfig(bool initial) {
+    if (g_ini_path.empty()) {
+        char path[MAX_PATH];
+        HMODULE self = GetModuleHandleA("OnimushaMod.dll");
+        if (!self) self = GetModuleHandleA(nullptr);
+        GetModuleFileNameA(self, path, MAX_PATH);
+        std::string s = path;
+        auto dot = s.find_last_of('.');
+        g_ini_path = (dot == std::string::npos) ? s + ".ini" : s.substr(0, dot) + ".ini";
+    }
+    const char* ini = g_ini_path.c_str();
 
     auto I = [&](const char* s, const char* k, int d) {
-        return (int)GetPrivateProfileIntA(s, k, d, ini.c_str());
+        return (int)GetPrivateProfileIntA(s, k, d, ini);
     };
     auto F = [&](const char* s, const char* k, float d) {
-        char buf[64]; GetPrivateProfileStringA(s, k, "", buf, sizeof(buf), ini.c_str());
+        char buf[64]; GetPrivateProfileStringA(s, k, "", buf, sizeof(buf), ini);
         return buf[0] ? (float)atof(buf) : d;
     };
+
+    // Snapshot previous for diff (only on reload)
+    if (!initial) g_cfg_prev = g_cfg;
+
     g_cfg.enabled         = I("AnimationCancel", "Enabled", 1) != 0;
     g_cfg.cat[CAT_ATTACK] = I("AnimationCancel", "Attacks", 1) != 0;
     g_cfg.cat[CAT_DODGE]  = I("AnimationCancel", "Dodge",   1) != 0;
@@ -247,23 +259,57 @@ static void LoadConfig() {
     g_cfg.feat_window     = I("Features", "WindowMultiplier", 1) != 0;
     g_cfg.feat_reflex     = I("Features", "ReflexHold", 1) != 0;
     g_cfg.feat_wrappers   = I("Features", "WrapperOverrides", 0) != 0;
-    g_cfg.hook_late       = I("Hooks", "LateUpdate", 1) != 0;
-    g_cfg.hook_ctrl       = I("Hooks", "CtrlUpdate", 1) != 0;
-    g_cfg.hook_sel        = I("Hooks", "SelUpdate", 1) != 0;
-    g_cfg.hook_gjf        = I("Hooks", "GetJustFrame", 1) != 0;
-    g_cfg.safe_mode       = I("Debug", "SafeMode", 1) != 0;   // DEFAULT 1
+    g_cfg.safe_mode       = I("Debug", "SafeMode", 1) != 0;
     g_cfg.log_on          = I("Debug", "Log", 1) != 0;
     g_cfg.hotkey_f1       = I("Debug", "HotkeyF1", 1) != 0;
+    g_cfg.hotkey_f2       = I("Debug", "HotkeyF2", 1) != 0;
 
-    Log("[cfg] enabled=%d cats a=%d d=%d g=%d m=%d i=%d o=%d",
-        g_cfg.enabled, g_cfg.cat[0], g_cfg.cat[1], g_cfg.cat[2],
-        g_cfg.cat[3], g_cfg.cat[4], g_cfg.cat[5]);
-    Log("[cfg] features phase=%d mask=%d lockout=%d window=%d reflex=%d wrap=%d",
-        g_cfg.feat_phase, g_cfg.feat_mask, g_cfg.feat_lockout,
-        g_cfg.feat_window, g_cfg.feat_reflex, g_cfg.feat_wrappers);
-    Log("[cfg] hooks late=%d ctrl=%d sel=%d gjf=%d SAFE=%d",
-        g_cfg.hook_late, g_cfg.hook_ctrl, g_cfg.hook_sel, g_cfg.hook_gjf,
-        g_cfg.safe_mode);
+    // [Hooks] only at initial inject: MinHook cannot safely reinstall at runtime
+    if (initial) {
+        g_cfg.hook_late = I("Hooks", "LateUpdate", 1) != 0;
+        g_cfg.hook_ctrl = I("Hooks", "CtrlUpdate", 1) != 0;
+        g_cfg.hook_sel  = I("Hooks", "SelUpdate", 1) != 0;
+        g_cfg.hook_gjf  = I("Hooks", "GetJustFrame", 1) != 0;
+        Log("[cfg] enabled=%d cats a=%d d=%d g=%d m=%d i=%d o=%d",
+            g_cfg.enabled, g_cfg.cat[0], g_cfg.cat[1], g_cfg.cat[2],
+            g_cfg.cat[3], g_cfg.cat[4], g_cfg.cat[5]);
+        Log("[cfg] features phase=%d mask=%d lockout=%d window=%d reflex=%d wrap=%d",
+            g_cfg.feat_phase, g_cfg.feat_mask, g_cfg.feat_lockout,
+            g_cfg.feat_window, g_cfg.feat_reflex, g_cfg.feat_wrappers);
+        Log("[cfg] hooks late=%d ctrl=%d sel=%d gjf=%d SAFE=%d",
+            g_cfg.hook_late, g_cfg.hook_ctrl, g_cfg.hook_sel, g_cfg.hook_gjf,
+            g_cfg.safe_mode);
+    } else {
+        // Log only what changed
+        auto D = [](const char* n, int a, int b) {
+            if (a != b) Log("[cfg] reload: %s %d -> %d", n, a, b);
+        };
+        auto Df = [](const char* n, float a, float b) {
+            if (a != b) Log("[cfg] reload: %s %.2f -> %.2f", n, a, b);
+        };
+        D("Enabled",   g_cfg_prev.enabled,   g_cfg.enabled);
+        D("Attacks",   g_cfg_prev.cat[0],    g_cfg.cat[0]);
+        D("Dodge",     g_cfg_prev.cat[1],    g_cfg.cat[1]);
+        D("Guard",     g_cfg_prev.cat[2],    g_cfg.cat[2]);
+        D("Move",      g_cfg_prev.cat[3],    g_cfg.cat[3]);
+        D("Issen",     g_cfg_prev.cat[4],    g_cfg.cat[4]);
+        D("Other",     g_cfg_prev.cat[5],    g_cfg.cat[5]);
+        D("GuardLockout",   g_cfg_prev.lock_guard, g_cfg.lock_guard);
+        D("IssenLockout",   g_cfg_prev.lock_issen, g_cfg.lock_issen);
+        D("GrabLockout",    g_cfg_prev.lock_grab,  g_cfg.lock_grab);
+        D("DodgeLockout",   g_cfg_prev.lock_dodge, g_cfg.lock_dodge);
+        Df("GuardWindow",   g_cfg_prev.wm_guard,  g_cfg.wm_guard);
+        Df("IssenWindow",   g_cfg_prev.wm_issen,  g_cfg.wm_issen);
+        Df("GrabWindow",    g_cfg_prev.wm_grab,   g_cfg.wm_grab);
+        Df("DodgeWindow",   g_cfg_prev.wm_dodge,  g_cfg.wm_dodge);
+        D("PhaseWrites",     g_cfg_prev.feat_phase,    g_cfg.feat_phase);
+        D("MaskClearing",    g_cfg_prev.feat_mask,     g_cfg.feat_mask);
+        D("LockoutOverride", g_cfg_prev.feat_lockout,  g_cfg.feat_lockout);
+        D("WindowMultiplier",g_cfg_prev.feat_window,   g_cfg.feat_window);
+        D("ReflexHold",      g_cfg_prev.feat_reflex,   g_cfg.feat_reflex);
+        D("SafeMode",        g_cfg_prev.safe_mode,     g_cfg.safe_mode);
+        Log("[cfg] reload complete");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -298,7 +344,6 @@ static bool CallIsJDAccepting(void* jds) {
 static void RefreshSeq() {
     if (!g_rt.entity) return;
     void* seq = RdPtr(g_rt.entity, OFF_PCE_SEQ);
-    // Validate: pointer must be in plausible user-space and 8-aligned
     uintptr_t sa = (uintptr_t)seq;
     bool plausible = seq && sa >= 0x10000 && sa <= 0x7FFFFFFFFFFF && (sa & 7) == 0;
     if (!plausible) seq = nullptr;
@@ -376,9 +421,9 @@ static void ForcePhases() {
 // ─────────────────────────────────────────────────────────────
 static void Unmask(void* mask_obj) {
     if (!g_cfg.feat_mask || !mask_obj || !g_cfg.enabled || g_rt.held) return;
+    if (g_cfg.safe_mode) return;
     bool in_combat = (g_rt.state & (ATTACK_BIT | EVADE_BIT | BLOCK_BIT | PARRY_BIT)) != 0;
-    if (!in_combat && !g_cfg.safe_mode) return;
-    if (g_cfg.safe_mode) return;   // require state confirmation to unmask
+    if (!in_combat) return;
     void* bitset = RdPtr(mask_obj, OFF_PCM_MASKS);
     if (!bitset) return;
     void* arr = RdPtr(bitset, OFF_BITSET_VALUE);
@@ -457,13 +502,23 @@ static void hk_LateUpdate(void* self) {
 
     if (g_rt.hook_entries[0]++ < 3) Log("[hook] late #%d self=%p", g_rt.hook_entries[0], self);
 
+    // F1: toggle enabled
     if (g_cfg.hotkey_f1) {
         bool down = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
-        if (down && !g_rt.hotkey_prev) {
+        if (down && !g_rt.f1_prev) {
             g_cfg.enabled = !g_cfg.enabled;
             Log("[hotkey] F1 -> enabled=%d", g_cfg.enabled);
         }
-        g_rt.hotkey_prev = down;
+        g_rt.f1_prev = down;
+    }
+    // F2: reload INI
+    if (g_cfg.hotkey_f2) {
+        bool down = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+        if (down && !g_rt.f2_prev) {
+            Log("[hotkey] F2 -> reloading config");
+            LoadConfig(false);
+        }
+        g_rt.f2_prev = down;
     }
 
     if (self) {
@@ -473,7 +528,7 @@ static void hk_LateUpdate(void* self) {
             g_rt.player = RdPtr(self, OFF_PACC_PC);
             g_rt.seq = nullptr;
             g_rt.layer_cache.clear();
-            g_rt.player_invalid = false;   // re-validate on entity change
+            g_rt.player_invalid = false;
             if (pce) Log("[state] entity=%p player=%p", pce, g_rt.player);
         }
         if (!g_rt.player && g_rt.frame - g_rt.last_entity_resolve > 60) {
@@ -528,9 +583,7 @@ static void hk_JFUUpdate(void* self) {
     ApplyLockout();
     if (o_JFUUpdate) {
         __try { o_JFUUpdate(self); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            Log("[crash] o_JFUUpdate crashed");
-        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] o_JFUUpdate crashed"); }
     }
 }
 
@@ -620,7 +673,7 @@ static void UninstallAll() {
 // Main
 // ─────────────────────────────────────────────────────────────
 static DWORD WINAPI MainThread(LPVOID) {
-    LoadConfig();
+    LoadConfig(true);
     for (int i = 0; i < 240; i++) {
         HMODULE mod = GetModuleHandleA("OnimushaWotS.exe");
         if (!mod) { Sleep(500); continue; }
@@ -636,7 +689,7 @@ static DWORD WINAPI MainThread(LPVOID) {
         Log("[+] build verified: %p", mod);
         int n = InstallAll();
         if (n == 0) { Log("[-] no hooks installed"); return 0; }
-        Log("[+] ready (%d hooks). SAFE_MODE=%d. Press F1 in game to toggle.",
+        Log("[+] ready (%d hooks). SAFE=%d. F1=toggle, F2=reload INI.",
             n, g_cfg.safe_mode ? 1 : 0);
         return 0;
     }
