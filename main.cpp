@@ -1,5 +1,5 @@
 // Onimusha: Way of the Sword - standalone mod DLL.
-// Port of animation_cancel.lua + instant_parry.lua.
+// Defensive build: SEH around all game calls + crash-once-then-disable.
 // Target: Steam 24769601 / 01.000.001, TimeDateStamp 0x6A827CEA,
 // SizeOfImage 0x249F0000, image base 0x140000000.
 
@@ -23,12 +23,12 @@ static constexpr DWORD     kSizeOfImage = 0x249F0000;
 static constexpr uintptr_t kBase        = 0x140000000;
 
 // ─────────────────────────────────────────────────────────────
-// RVAs (from REFramework dumps; all absolute - 0x140000000)
+// RVAs
 // ─────────────────────────────────────────────────────────────
 static constexpr uintptr_t RVA_PACC_LATEUPDATE      = 0x49A55A0;
 static constexpr uintptr_t RVA_PCC_UPDATE           = 0x2015F0;
 static constexpr uintptr_t RVA_PAS_UPDATE           = 0x455340;
-static constexpr uintptr_t RVA_JFU_GETJUSTFRAME     = 0x9D7BB0;   // <-- FIXED (was 0x5101170)
+static constexpr uintptr_t RVA_JFU_GETJUSTFRAME     = 0x9D7BB0;
 static constexpr uintptr_t RVA_JFU_UPDATE           = 0x40D950;
 static constexpr uintptr_t RVA_PCE_CHECKCANCEL_T    = 0x4B23C10;
 static constexpr uintptr_t RVA_PCE_CHECKPRECANCEL_T = 0x4B23C50;
@@ -132,7 +132,7 @@ struct Config {
     bool feat_phase = true, feat_mask = true, feat_lockout = true,
          feat_window = true, feat_reflex = true, feat_wrappers = false;
     bool hook_late = true, hook_ctrl = true, hook_sel = true, hook_gjf = true;
-    bool safe_mode = false;
+    bool safe_mode = true;     // DEFAULT ON: no game function calls
     bool log_on = true;
     bool hotkey_f1 = true;
 } g_cfg;
@@ -160,6 +160,13 @@ struct RuntimeState {
     uint64_t hotkey_prev = 0;
     int      gjf_calls = 0;
     uint64_t last_entity_resolve = 0;
+
+    // Crash guards
+    bool player_invalid = false;
+    bool gjc_disabled = false;
+    bool o_late_crashed = false, o_ctrl_crashed = false,
+         o_sel_crashed = false, o_gjf_crashed = false;
+    int  hook_entries[4] = {0,0,0,0};   // late, ctrl, sel, gjf
 } g_rt;
 
 // ─────────────────────────────────────────────────────────────
@@ -195,9 +202,6 @@ static bool SafeWrite(void* base, uintptr_t off, T v) {
 }
 static inline void* RdPtr(void* base, uintptr_t off) {
     void* v = nullptr; return SafeRead(base, off, v) ? v : nullptr;
-}
-static inline int64_t RdI64(void* base, uintptr_t off, int64_t d = 0) {
-    int64_t v = d; return SafeRead(base, off, v) ? v : d;
 }
 static inline int32_t RdI32(void* base, uintptr_t off, int32_t d = 0) {
     int32_t v = d; return SafeRead(base, off, v) ? v : d;
@@ -247,7 +251,7 @@ static void LoadConfig() {
     g_cfg.hook_ctrl       = I("Hooks", "CtrlUpdate", 1) != 0;
     g_cfg.hook_sel        = I("Hooks", "SelUpdate", 1) != 0;
     g_cfg.hook_gjf        = I("Hooks", "GetJustFrame", 1) != 0;
-    g_cfg.safe_mode       = I("Debug", "SafeMode", 0) != 0;
+    g_cfg.safe_mode       = I("Debug", "SafeMode", 1) != 0;   // DEFAULT 1
     g_cfg.log_on          = I("Debug", "Log", 1) != 0;
     g_cfg.hotkey_f1       = I("Debug", "HotkeyF1", 1) != 0;
 
@@ -257,25 +261,35 @@ static void LoadConfig() {
     Log("[cfg] features phase=%d mask=%d lockout=%d window=%d reflex=%d wrap=%d",
         g_cfg.feat_phase, g_cfg.feat_mask, g_cfg.feat_lockout,
         g_cfg.feat_window, g_cfg.feat_reflex, g_cfg.feat_wrappers);
-    Log("[cfg] hooks late=%d ctrl=%d sel=%d gjf=%d safe=%d",
+    Log("[cfg] hooks late=%d ctrl=%d sel=%d gjf=%d SAFE=%d",
         g_cfg.hook_late, g_cfg.hook_ctrl, g_cfg.hook_sel, g_cfg.hook_gjf,
         g_cfg.safe_mode);
 }
 
 // ─────────────────────────────────────────────────────────────
-// Game calls
+// Game calls (defensive)
 // ─────────────────────────────────────────────────────────────
 static int64_t CallGetActionState(void* player) {
-    if (!player) return 0;
+    if (!player || g_rt.player_invalid) return 0;
     typedef int64_t(*Fn)(void*);
     auto fn = (Fn)(kBase + RVA_CB_GETACTIONSTATE);
-    __try { return fn(player); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    __try { return fn(player); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_rt.player_invalid = true;
+        Log("[crash] getActionState(player=%p) crashed -> player disabled", player);
+        return 0;
+    }
 }
 static bool CallIsJDAccepting(void* jds) {
-    if (!jds) return false;
+    if (!jds || g_rt.gjc_disabled) return false;
     typedef bool(*Fn)(void*);
     auto fn = (Fn)(kBase + RVA_JDS_ISACCEPTING);
-    __try { return fn(jds); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    __try { return fn(jds); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_rt.gjc_disabled = true;
+        Log("[crash] isJustDodgeAttackAccepting(%p) crashed -> disabled", jds);
+        return false;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -284,15 +298,17 @@ static bool CallIsJDAccepting(void* jds) {
 static void RefreshSeq() {
     if (!g_rt.entity) return;
     void* seq = RdPtr(g_rt.entity, OFF_PCE_SEQ);
+    // Validate: pointer must be in plausible user-space and 8-aligned
+    uintptr_t sa = (uintptr_t)seq;
+    bool plausible = seq && sa >= 0x10000 && sa <= 0x7FFFFFFFFFFF && (sa & 7) == 0;
+    if (!plausible) seq = nullptr;
     if (seq == g_rt.seq) return;
     g_rt.seq = seq;
     g_rt.seq_count = 0;
     g_rt.layer_cache.clear();
-    if (seq && (uintptr_t)seq >= 0x10000) {
+    if (seq) {
         int32_t cnt = RdI32(seq, OFF_ARR_COUNT);
         if (cnt > 0 && cnt < 128) g_rt.seq_count = (uint32_t)cnt;
-    } else {
-        g_rt.seq = nullptr;   // reject garbage pointers
     }
     Log("[state] seq=%p layers=%u", g_rt.seq, g_rt.seq_count);
 }
@@ -305,7 +321,7 @@ static void UpdateState() {
     if (g_cfg.feat_phase) RefreshSeq();
     if (g_rt.frame % 600 == 0) { g_rt.seq = nullptr; g_rt.layer_cache.clear(); }
 
-    if (g_cfg.safe_mode) {
+    if (g_cfg.safe_mode || g_rt.player_invalid) {
         g_rt.state = 0;
         g_rt.jd_open = false;
     } else {
@@ -361,7 +377,8 @@ static void ForcePhases() {
 static void Unmask(void* mask_obj) {
     if (!g_cfg.feat_mask || !mask_obj || !g_cfg.enabled || g_rt.held) return;
     bool in_combat = (g_rt.state & (ATTACK_BIT | EVADE_BIT | BLOCK_BIT | PARRY_BIT)) != 0;
-    if (!in_combat) return;
+    if (!in_combat && !g_cfg.safe_mode) return;
+    if (g_cfg.safe_mode) return;   // require state confirmation to unmask
     void* bitset = RdPtr(mask_obj, OFF_PCM_MASKS);
     if (!bitset) return;
     void* arr = RdPtr(bitset, OFF_BITSET_VALUE);
@@ -410,7 +427,7 @@ static void ApplyLockout() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Original pointers
+// Original function pointers
 // ─────────────────────────────────────────────────────────────
 typedef void  (*LateUpdateFn)(void*);
 typedef void  (*CtrlUpdateFn)(void*, void*);
@@ -433,10 +450,12 @@ static bool ShouldOverride(uint32_t cmd) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Hook implementations
+// Hook implementations (defensive)
 // ─────────────────────────────────────────────────────────────
 static void hk_LateUpdate(void* self) {
     g_rt.frame++;
+
+    if (g_rt.hook_entries[0]++ < 3) Log("[hook] late #%d self=%p", g_rt.hook_entries[0], self);
 
     if (g_cfg.hotkey_f1) {
         bool down = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
@@ -454,50 +473,79 @@ static void hk_LateUpdate(void* self) {
             g_rt.player = RdPtr(self, OFF_PACC_PC);
             g_rt.seq = nullptr;
             g_rt.layer_cache.clear();
+            g_rt.player_invalid = false;   // re-validate on entity change
             if (pce) Log("[state] entity=%p player=%p", pce, g_rt.player);
         }
-        // Retry player resolution every 60 frames if missing
         if (!g_rt.player && g_rt.frame - g_rt.last_entity_resolve > 60) {
             g_rt.last_entity_resolve = g_rt.frame;
             g_rt.player = RdPtr(self, OFF_PACC_PC);
-            if (g_rt.player) Log("[state] player resolved late: %p", g_rt.player);
+            if (g_rt.player) Log("[state] player late: %p", g_rt.player);
         }
     }
 
     UpdateState();
     ForcePhases();
-    o_LateUpdate(self);
+
+    if (o_LateUpdate && !g_rt.o_late_crashed) {
+        __try { o_LateUpdate(self); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_rt.o_late_crashed = true;
+            Log("[crash] o_LateUpdate crashed -> disabled");
+        }
+    }
 }
 
 static void hk_CtrlUpdate(void* self, void* mask) {
+    if (g_rt.hook_entries[1]++ < 3)
+        Log("[hook] ctrl #%d self=%p mask=%p", g_rt.hook_entries[1], self, mask);
     UpdateState();
     ForcePhases();
     Unmask(mask);
-    o_CtrlUpdate(self, mask);
+    if (o_CtrlUpdate && !g_rt.o_ctrl_crashed) {
+        __try { o_CtrlUpdate(self, mask); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_rt.o_ctrl_crashed = true;
+            Log("[crash] o_CtrlUpdate crashed -> disabled");
+        }
+    }
 }
 
 static void hk_SelUpdate(void* self) {
+    if (g_rt.hook_entries[2]++ < 3) Log("[hook] sel #%d self=%p", g_rt.hook_entries[2], self);
     UpdateState();
     ForcePhases();
-    o_SelUpdate(self);
+    if (o_SelUpdate && !g_rt.o_sel_crashed) {
+        __try { o_SelUpdate(self); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_rt.o_sel_crashed = true;
+            Log("[crash] o_SelUpdate crashed -> disabled");
+        }
+    }
 }
 
 static void hk_JFUUpdate(void* self) {
     AdoptJFU(self);
     ApplyLockout();
-    o_JFUUpdate(self);
+    if (o_JFUUpdate) {
+        __try { o_JFUUpdate(self); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[crash] o_JFUUpdate crashed");
+        }
+    }
 }
 
 static float hk_GetJustFrame(void* self, uint32_t type, uint32_t cat,
                               void* obj, void* rank) {
-    if (g_rt.gjf_calls < 5) {
-        Log("[gjf] call #%d self=%p type=%u cat=%u obj=%p rank=%p",
-            g_rt.gjf_calls, self, type, cat, obj, rank);
-        g_rt.gjf_calls++;
-    }
+    if (g_rt.hook_entries[3]++ < 5)
+        Log("[hook] gjf #%d type=%u cat=%u", g_rt.hook_entries[3], type, cat);
+    if (!o_GetJustFrame || g_rt.o_gjf_crashed) return 0.0f;
     float orig = 0.0f;
     __try { orig = o_GetJustFrame(self, type, cat, obj, rank); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return 0.0f; }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_rt.o_gjf_crashed = true;
+        Log("[crash] o_GetJustFrame crashed -> disabled");
+        return 0.0f;
+    }
     if (!g_cfg.feat_window || !g_cfg.enabled || orig <= 0.0f) return orig;
     float m = 1.0f;
     switch (type) {
@@ -512,10 +560,12 @@ static float hk_GetJustFrame(void* self, uint32_t type, uint32_t cat,
 }
 
 static bool hk_PCCancel(void* self, uint32_t cmd) {
+    if (!o_PCCancel) return false;
     bool orig = o_PCCancel(self, cmd);
     return ShouldOverride(cmd) ? true : orig;
 }
 static bool hk_PCPreCancel(void* self, uint32_t cmd) {
+    if (!o_PCPreCancel) return false;
     bool orig = o_PCPreCancel(self, cmd);
     return ShouldOverride(cmd) ? true : orig;
 }
@@ -536,19 +586,16 @@ static HookInst g_hooks[] = {
     { RVA_PCE_CHECKCANCEL_T,(void*)hk_PCCancel,    (void**)&o_PCCancel,    "PCE.checkCancelMotion",    nullptr, true, false },
     { RVA_PCE_CHECKPRECANCEL_T,(void*)hk_PCPreCancel,(void**)&o_PCPreCancel,"PCE.checkPreCancelMotion", nullptr, true, false },
 };
-static constexpr size_t kHookCount = sizeof(g_hooks) / sizeof(g_hooks[0]);
 
 static int InstallAll() {
     if (MH_Initialize() != MH_OK) { Log("[-] MH_Initialize failed"); return 0; }
     int ok = 0;
     for (auto& h : g_hooks) {
         if (h.optional && !g_cfg.feat_wrappers) {
-            Log("[i] skip %s (WrapperOverrides=0)", h.name);
-            continue;
+            Log("[i] skip %s (WrapperOverrides=0)", h.name); continue;
         }
         if (h.flag && !*h.flag) {
-            Log("[i] skip %s (hook flag off)", h.name);
-            continue;
+            Log("[i] skip %s (hook flag off)", h.name); continue;
         }
         void* target = (void*)(kBase + h.rva);
         MH_STATUS s1 = MH_CreateHook(target, h.fn, h.orig);
@@ -557,8 +604,7 @@ static int InstallAll() {
             Log("[-] %s hook failed (%d)", h.name, (int)s2);
         } else {
             Log("[+] %s hooked @ 0x%llX", h.name, (unsigned long long)h.rva);
-            h.ok = true;
-            ok++;
+            h.ok = true; ok++;
         }
     }
     return ok;
@@ -590,7 +636,8 @@ static DWORD WINAPI MainThread(LPVOID) {
         Log("[+] build verified: %p", mod);
         int n = InstallAll();
         if (n == 0) { Log("[-] no hooks installed"); return 0; }
-        Log("[+] ready (%d hooks). Press F1 in game to toggle.", n);
+        Log("[+] ready (%d hooks). SAFE_MODE=%d. Press F1 in game to toggle.",
+            n, g_cfg.safe_mode ? 1 : 0);
         return 0;
     }
     Log("[-] OnimushaWotS.exe not found");
