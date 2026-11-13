@@ -6,6 +6,10 @@
 //
 // Target: Steam 24769601 / 01.000.001, TimeDateStamp 0x6A827CEA,
 // SizeOfImage 0x249F0000, image base 0x140000000.
+//
+// NOTE: all __try/__except live in POD-only helper functions (Call* / Read*)
+// so the hook functions can freely use std::string. MSVC C2712 forbids mixing
+// SEH with C++ object unwinding in the same function.
 
 #include <windows.h>
 #include <cstdint>
@@ -36,42 +40,29 @@ static constexpr uintptr_t RVA_PCE_GETCANCELSEQ     = 0x6795B20;
 // Field offsets
 // ─────────────────────────────────────────────────────────────
 static constexpr uintptr_t OFF_CCCMD_PHASE  = 0x10;
-static constexpr uintptr_t OFF_PC_ENTITY    = 0x1F0;   // PlayerCharacter._PlayerCharacterEntity
+static constexpr uintptr_t OFF_PC_ENTITY    = 0x1F0;
 static constexpr uintptr_t OFF_PCE_SEQ      = 0x5B8;
 static constexpr uintptr_t OFF_ARR_COUNT    = 0x1C;
 static constexpr uintptr_t OFF_ARR_DATA     = 0x20;
 
 // ─────────────────────────────────────────────────────────────
-// ACTION_STATE_BIT names (from REFramework dump)
+// ACTION_STATE_BIT names
 // ─────────────────────────────────────────────────────────────
 struct StateBit { uint64_t mask; const char* name; };
 static const StateBit kStateBits[] = {
-    { 0x1ull,         "STAND" },
-    { 0x2ull,         "CROUCH" },
-    { 0x4ull,         "AIR" },
-    { 0x8ull,         "DOWN" },
-    { 0x10ull,        "WALL" },
-    { 0x20ull,        "WATER" },
-    { 0x40ull,        "DIVING" },
-    { 0x10000ull,     "IDLE" },
-    { 0x20000ull,     "MOVING" },
-    { 0x40000ull,     "ATTACK" },
-    { 0x80000ull,     "GRAPPLE" },
-    { 0x100000ull,    "DAMAGE" },
-    { 0x200000ull,    "SMASH" },
-    { 0x400000ull,    "BLOCKED" },
-    { 0x800000ull,    "PARRIED" },
-    { 0x1000000ull,   "GUARD_WAIT" },
-    { 0x2000000ull,   "GUARD_HIT" },
-    { 0x4000000ull,   "GUARD_BREAK" },
-    { 0x8000000ull,   "BLOCK" },
-    { 0x10000000ull,  "PARRY" },
-    { 0x20000000ull,  "EVADE" },
-    { 0x40000000ull,  "SHELL_ATTACK" },
-    { 0x80000000ull,  "ATEMI" },
-    { 0x100000000ull, "FEINT" },
-    { 0x200000000ull, "EM_GRAB" },
-    { 0x400000000ull, "EM_UNAVOIDABLE" },
+    { 0x1ull,         "STAND" }, { 0x2ull,         "CROUCH" },
+    { 0x4ull,         "AIR" }, { 0x8ull,         "DOWN" },
+    { 0x10ull,        "WALL" }, { 0x20ull,        "WATER" },
+    { 0x40ull,        "DIVING" }, { 0x10000ull,     "IDLE" },
+    { 0x20000ull,     "MOVING" }, { 0x40000ull,     "ATTACK" },
+    { 0x80000ull,     "GRAPPLE" }, { 0x100000ull,    "DAMAGE" },
+    { 0x200000ull,    "SMASH" }, { 0x400000ull,    "BLOCKED" },
+    { 0x800000ull,    "PARRIED" }, { 0x1000000ull,   "GUARD_WAIT" },
+    { 0x2000000ull,   "GUARD_HIT" }, { 0x4000000ull,   "GUARD_BREAK" },
+    { 0x8000000ull,   "BLOCK" }, { 0x10000000ull,  "PARRY" },
+    { 0x20000000ull,  "EVADE" }, { 0x40000000ull,  "SHELL_ATTACK" },
+    { 0x80000000ull,  "ATEMI" }, { 0x100000000ull, "FEINT" },
+    { 0x200000000ull, "EM_GRAB" }, { 0x400000000ull, "EM_UNAVOIDABLE" },
     { 0x800000000ull, "EM_ATTACK_AFTER_GRAPPLE" },
 };
 static constexpr size_t kStateBitsCount = sizeof(kStateBits) / sizeof(kStateBits[0]);
@@ -89,7 +80,7 @@ static std::string StateStr(int64_t s) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Cancel key names (from dump1)
+// Cancel key names
 // ─────────────────────────────────────────────────────────────
 struct KeyName { uintptr_t offset; const char* name; };
 static const KeyName kKeyNames[] = {
@@ -124,12 +115,9 @@ struct Config {
     bool enabled = true;
     bool log_on = true;
     bool hotkey_f1 = true;
-    int  log_every_frames = 60;    // 1 summary per second at 60fps
+    int  log_every_frames = 60;
 } g_cfg;
 
-// ─────────────────────────────────────────────────────────────
-// Runtime state
-// ─────────────────────────────────────────────────────────────
 struct RuntimeState {
     void*    entity = nullptr;
     void*    player = nullptr;
@@ -163,25 +151,30 @@ static void Log(const char* fmt, ...) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Safe memory access
+// POD-only memory helpers (safe to use __try here)
 // ─────────────────────────────────────────────────────────────
-template<typename T>
-static bool SafeRead(void* base, uintptr_t off, T& out) {
-    __try { out = *(T*)((uintptr_t)base + off); return true; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+static void* ReadPtrRaw(void* base, uintptr_t off) {
+    __try { return *(void**)((uintptr_t)base + off); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
-static inline void* RdPtr(void* b, uintptr_t o) {
-    void* v = nullptr; return SafeRead(b, o, v) ? v : nullptr;
+
+static int32_t ReadI32Raw(void* base, uintptr_t off, int32_t def) {
+    __try { return *(int32_t*)((uintptr_t)base + off); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return def; }
 }
-static inline int32_t RdI32(void* b, uintptr_t o, int32_t d = 0) {
-    int32_t v = d; return SafeRead(b, o, v) ? v : d;
+
+static uintptr_t ReadUPtrRaw(void* base, uintptr_t off) {
+    __try { return *(uintptr_t*)((uintptr_t)base + off); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
-static inline uintptr_t RdUP(void* b, uintptr_t o, uintptr_t d = 0) {
-    uintptr_t v = d; return SafeRead(b, o, v) ? v : d;
+
+static void* ReadLayerPtrRaw(void* seq, uint32_t i) {
+    __try { return *(void**)((uintptr_t)seq + OFF_ARR_DATA + 8 * i); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
 
 // ─────────────────────────────────────────────────────────────
-// INI loader (idempotent, F1 hotkey handled elsewhere)
+// INI loader
 // ─────────────────────────────────────────────────────────────
 static std::string g_ini_path;
 static void LoadConfig(bool initial) {
@@ -202,7 +195,7 @@ static void LoadConfig(bool initial) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Game method wrappers (read-only, SEH-guarded)
+// Game method pointers + POD-only call wrappers
 // ─────────────────────────────────────────────────────────────
 typedef int64_t (*GetStateFn)(void*);
 typedef void*   (*GetBaseActionFn)(void*);
@@ -210,28 +203,59 @@ typedef void*   (*GetSeqFn)(void*);
 typedef void    (*CtrlUpFn)(void*, void*);
 typedef void    (*SelUpFn)(void*);
 
-static GetStateFn     o_GetState = nullptr;
+static GetStateFn     o_GetState      = nullptr;
 static GetBaseActionFn o_GetBaseAction = nullptr;
-static GetSeqFn       o_GetSeq   = nullptr;
-static CtrlUpFn       o_CtrlUp   = nullptr;
-static SelUpFn        o_SelUp    = nullptr;
+static GetSeqFn       o_GetSeq        = nullptr;
+static CtrlUpFn       o_CtrlUp        = nullptr;
+static SelUpFn        o_SelUp         = nullptr;
+
+// These return only POD, so __try is legal even though the callers use std::string.
+static int64_t CallGetState(void* player) {
+    if (!player || !o_GetState) return 0;
+    __try { return o_GetState(player); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+static void* CallGetBaseAction(void* self) {
+    if (!self || !o_GetBaseAction) return nullptr;
+    __try { return o_GetBaseAction(self); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+static void* CallGetSeq(void* entity) {
+    if (!entity || !o_GetSeq) return nullptr;
+    __try { return o_GetSeq(entity); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+static void CallCtrlUp(void* self, void* mask) {
+    if (!o_CtrlUp) return;
+    __try { o_CtrlUp(self, mask); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void CallSelUp(void* self) {
+    if (!o_SelUp) return;
+    __try { o_SelUp(self); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
 
 // ─────────────────────────────────────────────────────────────
-// Layer / key dump helpers
+// Layer / key dump helpers (no __try here, free to use std::string)
 // ─────────────────────────────────────────────────────────────
 static void DumpLayerPhases(void* layer, uint32_t idx) {
     if (!layer) return;
     std::string line;
     int nonzero = 0;
     for (const auto& kn : kKeyNames) {
-        void* key_obj = RdPtr(layer, kn.offset);
+        void* key_obj = ReadPtrRaw(layer, kn.offset);
         if (!key_obj) continue;
-        int32_t phase = RdI32(key_obj, OFF_CCCMD_PHASE, -1);
+        int32_t phase = ReadI32Raw(key_obj, OFF_CCCMD_PHASE, -1);
         if (phase < 0) continue;
         if (phase != 0) {
             if (!line.empty()) line += " ";
             char buf[64];
-            snprintf(buf, sizeof(buf), "%s=%d", kn.name + 1, phase);   // strip leading _
+            snprintf(buf, sizeof(buf), "%s=%d", kn.name + 1, phase);
             line += buf;
             nonzero++;
         }
@@ -245,7 +269,7 @@ static void DumpLayerPhases(void* layer, uint32_t idx) {
 
 static void RefreshSeq() {
     if (!g_rt.entity) { g_rt.seq = nullptr; g_rt.seq_count = 0; return; }
-    void* seq = RdPtr(g_rt.entity, OFF_PCE_SEQ);
+    void* seq = ReadPtrRaw(g_rt.entity, OFF_PCE_SEQ);
     uintptr_t sa = (uintptr_t)seq;
     bool ok = seq && sa >= 0x10000 && sa <= 0x7FFFFFFFFFFF && (sa & 7) == 0;
     if (!ok) { g_rt.seq = nullptr; g_rt.seq_count = 0; return; }
@@ -253,39 +277,28 @@ static void RefreshSeq() {
     g_rt.seq = seq;
     g_rt.seq_count = 0;
     g_rt.layer_seen.clear();
-    int32_t cnt = RdI32(seq, OFF_ARR_COUNT);
+    int32_t cnt = ReadI32Raw(seq, OFF_ARR_COUNT, 0);
     if (cnt > 0 && cnt < 128) g_rt.seq_count = (uint32_t)cnt;
     Log("[seq] changed -> %p layers=%u", seq, g_rt.seq_count);
 }
 
 // ─────────────────────────────────────────────────────────────
-// Hooks (read-only, never modify game state)
+// Hooks (no __try — all guarded calls go through the Call* helpers)
 // ─────────────────────────────────────────────────────────────
-
-// getActionState(this=player) -> int64_t
 static int64_t hk_GetState(void* player) {
-    int64_t s = 0;
-    if (o_GetState) {
-        __try { s = o_GetState(player); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { s = 0; }
-    }
+    int64_t s = CallGetState(player);
     if (player && !g_rt.player) {
         g_rt.player = player;
-        g_rt.entity = RdPtr(player, OFF_PC_ENTITY);
+        g_rt.entity = ReadPtrRaw(player, OFF_PC_ENTITY);
         Log("[capture] player=%p entity=%p", player, g_rt.entity);
     }
     return s;
 }
 
-// get_BaseCurrentAction(this=player) -> action*
 static void* hk_GetBaseAction(void* self) {
-    void* action = nullptr;
-    if (o_GetBaseAction) {
-        __try { action = o_GetBaseAction(self); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
+    void* action = CallGetBaseAction(self);
     if (action && action != g_rt.last_action) {
-        uintptr_t vtbl = RdUP(action, 0);
+        uintptr_t vtbl = ReadUPtrRaw(action, 0);
         g_rt.last_action = action;
         g_rt.last_vtable = vtbl;
         Log("[action] ptr=%p vtable=0x%llX", action, (unsigned long long)vtbl);
@@ -293,13 +306,8 @@ static void* hk_GetBaseAction(void* self) {
     return action;
 }
 
-// getCancelMotionSeq(this=entity) -> seq*
 static void* hk_GetSeq(void* entity) {
-    void* seq = nullptr;
-    if (o_GetSeq) {
-        __try { seq = o_GetSeq(entity); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
+    void* seq = CallGetSeq(entity);
     if (entity && !g_rt.entity) {
         g_rt.entity = entity;
         Log("[capture] entity=%p (from getCancelMotionSeq)", entity);
@@ -307,7 +315,6 @@ static void* hk_GetSeq(void* entity) {
     return seq;
 }
 
-// ctrlUpdate(this, mask) - dump summary
 static void hk_CtrlUp(void* self, void* mask) {
     g_rt.frame++;
     if (g_cfg.hotkey_f1) {
@@ -319,28 +326,18 @@ static void hk_CtrlUp(void* self, void* mask) {
         g_rt.f1_prev = d;
     }
     if (g_cfg.enabled) {
-        // call getActionState directly if we have player
-        int64_t s = 0;
-        if (g_rt.player && o_GetState) {
-            __try { s = o_GetState(g_rt.player); }
-            __except (EXCEPTION_EXECUTE_HANDLER) {}
-        }
-        // log on state change
+        int64_t s = CallGetState(g_rt.player);
         if (s != g_rt.last_state) {
             Log("[state] 0x%llX %s", (unsigned long long)s, StateStr(s).c_str());
             g_rt.last_state = s;
-            // on every state change, dump phase keys of all layers
             RefreshSeq();
             if (g_rt.seq && g_rt.seq_count > 0) {
                 for (uint32_t i = 0; i < g_rt.seq_count; i++) {
-                    void* layer = nullptr;
-                    __try { layer = *(void**)((uintptr_t)g_rt.seq + OFF_ARR_DATA + 8 * i); }
-                    __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+                    void* layer = ReadLayerPtrRaw(g_rt.seq, i);
                     if (layer) DumpLayerPhases(layer, i);
                 }
             }
         }
-        // periodic summary
         if (g_rt.frame - g_rt.last_summary >= (uint64_t)g_cfg.log_every_frames) {
             g_rt.last_summary = g_rt.frame;
             Log("[summary] frame=%llu state=0x%llX action=%p vtbl=0x%llX seq_layers=%u",
@@ -349,18 +346,11 @@ static void hk_CtrlUp(void* self, void* mask) {
                 (unsigned long long)g_rt.last_vtable, g_rt.seq_count);
         }
     }
-    if (o_CtrlUp) {
-        __try { o_CtrlUp(self, mask); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
+    CallCtrlUp(self, mask);
 }
 
-// selUpdate(this) - passthrough only (no state we need here)
 static void hk_SelUp(void* self) {
-    if (o_SelUp) {
-        __try { o_SelUp(self); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
+    CallSelUp(self);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -374,13 +364,12 @@ struct HookInst {
     bool ok;
 };
 static HookInst g_hooks[] = {
-    { RVA_CB_GETACTIONSTATE, (void*)hk_GetState,      (void**)&o_GetState,      "CharacterBase.getActionState",          false },
-    { RVA_CB_GETBASEACTION,  (void*)hk_GetBaseAction, (void**)&o_GetBaseAction, "CharacterBase.get_BaseCurrentAction",   false },
-    { RVA_PCE_GETCANCELSEQ,  (void*)hk_GetSeq,        (void**)&o_GetSeq,        "PCE.getCancelMotionSeq",                false },
-    { RVA_PCC_UPDATE,        (void*)hk_CtrlUp,        (void**)&o_CtrlUp,        "PCC.update",                            false },
-    { RVA_PAS_UPDATE,        (void*)hk_SelUp,         (void**)&o_SelUp,         "PAS.update",                            false },
+    { RVA_CB_GETACTIONSTATE, (void*)hk_GetState,      (void**)&o_GetState,      "CharacterBase.getActionState",        false },
+    { RVA_CB_GETBASEACTION,  (void*)hk_GetBaseAction, (void**)&o_GetBaseAction, "CharacterBase.get_BaseCurrentAction", false },
+    { RVA_PCE_GETCANCELSEQ,  (void*)hk_GetSeq,        (void**)&o_GetSeq,        "PCE.getCancelMotionSeq",              false },
+    { RVA_PCC_UPDATE,        (void*)hk_CtrlUp,        (void**)&o_CtrlUp,        "PCC.update",                          false },
+    { RVA_PAS_UPDATE,        (void*)hk_SelUp,         (void**)&o_SelUp,         "PAS.update",                          false },
 };
-static constexpr size_t kHookCount = sizeof(g_hooks) / sizeof(g_hooks[0]);
 
 static int InstallAll() {
     if (MH_Initialize() != MH_OK) { Log("[-] MH_Initialize failed"); return 0; }
