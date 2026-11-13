@@ -118,6 +118,8 @@ static const KeyName kKeyNames[] = {
 static constexpr size_t kKeysCount = sizeof(kKeyNames) / sizeof(kKeyNames[0]);
 
 // ─────────────────────────────────────────────────────────────
+// Config
+// ─────────────────────────────────────────────────────────────
 struct Config {
     bool enabled = true;
     bool log_on = true;
@@ -125,6 +127,8 @@ struct Config {
     int  log_every_frames = 60;    // 1 summary per second at 60fps
 } g_cfg;
 
+// ─────────────────────────────────────────────────────────────
+// Runtime state
 // ─────────────────────────────────────────────────────────────
 struct RuntimeState {
     void*    entity = nullptr;
@@ -134,13 +138,14 @@ struct RuntimeState {
     void*    last_action = nullptr;
     uintptr_t last_vtable = 0;
     int64_t  last_state = 0;
-    bool     last_held = false;
     uint64_t frame = 0;
     uint64_t last_summary = 0;
     bool     f1_prev = false;
     std::unordered_map<uintptr_t, bool> layer_seen;
 } g_rt;
 
+// ─────────────────────────────────────────────────────────────
+// Logging
 // ─────────────────────────────────────────────────────────────
 static std::string g_log_path;
 static void Log(const char* fmt, ...) {
@@ -158,6 +163,8 @@ static void Log(const char* fmt, ...) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Safe memory access
+// ─────────────────────────────────────────────────────────────
 template<typename T>
 static bool SafeRead(void* base, uintptr_t off, T& out) {
     __try { out = *(T*)((uintptr_t)base + off); return true; }
@@ -174,7 +181,7 @@ static inline uintptr_t RdUP(void* b, uintptr_t o, uintptr_t d = 0) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// INI loader (idempotent, F2 reloads)
+// INI loader (idempotent, F1 hotkey handled elsewhere)
 // ─────────────────────────────────────────────────────────────
 static std::string g_ini_path;
 static void LoadConfig(bool initial) {
@@ -191,7 +198,7 @@ static void LoadConfig(bool initial) {
     g_cfg.hotkey_f1        = GetPrivateProfileIntA("Debug", "HotkeyF1", 1, ini) != 0;
     g_cfg.log_every_frames = GetPrivateProfileIntA("Dump", "LogEveryFrames", 60, ini);
     if (initial) Log("[cfg] dump enabled=%d log_every=%d", g_cfg.enabled, g_cfg.log_every_frames);
-    else Log("[cfg] reload complete (F2)");
+    else Log("[cfg] reload complete");
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -252,13 +259,16 @@ static void RefreshSeq() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Hooks (read-only)
+// Hooks (read-only, never modify game state)
 // ─────────────────────────────────────────────────────────────
 
 // getActionState(this=player) -> int64_t
 static int64_t hk_GetState(void* player) {
     int64_t s = 0;
-    if (o_GetState) { __try { s = o_GetState(player); } __except (EXCEPTION_EXECUTE_HANDLER) { s = 0; } }
+    if (o_GetState) {
+        __try { s = o_GetState(player); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { s = 0; }
+    }
     if (player && !g_rt.player) {
         g_rt.player = player;
         g_rt.entity = RdPtr(player, OFF_PC_ENTITY);
@@ -271,7 +281,8 @@ static int64_t hk_GetState(void* player) {
 static void* hk_GetBaseAction(void* self) {
     void* action = nullptr;
     if (o_GetBaseAction) {
-        __try { action = o_GetBaseAction(self); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        __try { action = o_GetBaseAction(self); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
     if (action && action != g_rt.last_action) {
         uintptr_t vtbl = RdUP(action, 0);
@@ -285,7 +296,10 @@ static void* hk_GetBaseAction(void* self) {
 // getCancelMotionSeq(this=entity) -> seq*
 static void* hk_GetSeq(void* entity) {
     void* seq = nullptr;
-    if (o_GetSeq) { __try { seq = o_GetSeq(entity); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+    if (o_GetSeq) {
+        __try { seq = o_GetSeq(entity); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
     if (entity && !g_rt.entity) {
         g_rt.entity = entity;
         Log("[capture] entity=%p (from getCancelMotionSeq)", entity);
@@ -296,16 +310,20 @@ static void* hk_GetSeq(void* entity) {
 // ctrlUpdate(this, mask) - dump summary
 static void hk_CtrlUp(void* self, void* mask) {
     g_rt.frame++;
-    if (g_rt.hotkey_f1) {
+    if (g_cfg.hotkey_f1) {
         bool d = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
-        if (d && !g_rt.f1_prev) { g_cfg.enabled = !g_cfg.enabled; Log("[hotkey] F1 -> dump=%d", g_cfg.enabled); }
+        if (d && !g_rt.f1_prev) {
+            g_cfg.enabled = !g_cfg.enabled;
+            Log("[hotkey] F1 -> dump=%d", g_cfg.enabled);
+        }
         g_rt.f1_prev = d;
     }
-    if (g_rt.enabled) {
+    if (g_cfg.enabled) {
         // call getActionState directly if we have player
         int64_t s = 0;
         if (g_rt.player && o_GetState) {
-            __try { s = o_GetState(g_rt.player); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            __try { s = o_GetState(g_rt.player); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
         // log on state change
         if (s != g_rt.last_state) {
@@ -331,26 +349,38 @@ static void hk_CtrlUp(void* self, void* mask) {
                 (unsigned long long)g_rt.last_vtable, g_rt.seq_count);
         }
     }
-    if (o_CtrlUp) { __try { o_CtrlUp(self, mask); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+    if (o_CtrlUp) {
+        __try { o_CtrlUp(self, mask); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
 }
 
+// selUpdate(this) - passthrough only (no state we need here)
 static void hk_SelUp(void* self) {
-    if (o_SelUp) { __try { o_SelUp(self); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+    if (o_SelUp) {
+        __try { o_SelUp(self); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
 // Install
 // ─────────────────────────────────────────────────────────────
 struct HookInst {
-    uintptr_t rva; void* fn; void** orig; const char* name; bool ok;
+    uintptr_t rva;
+    void* fn;
+    void** orig;
+    const char* name;
+    bool ok;
 };
 static HookInst g_hooks[] = {
-    { RVA_CB_GETACTIONSTATE, (void*)hk_GetState,      (void**)&o_GetState,      "CharacterBase.getActionState",   false },
-    { RVA_CB_GETBASEACTION,  (void*)hk_GetBaseAction, (void**)&o_GetBaseAction, "CharacterBase.get_BaseCurrentAction", false },
-    { RVA_PCE_GETCANCELSEQ,  (void*)hk_GetSeq,        (void**)&o_GetSeq,        "PCE.getCancelMotionSeq",         false },
-    { RVA_PCC_UPDATE,        (void*)hk_CtrlUp,        (void**)&o_CtrlUp,        "PCC.update",                     false },
-    { RVA_PAS_UPDATE,        (void*)hk_SelUp,         (void**)&o_SelUp,         "PAS.update",                     false },
+    { RVA_CB_GETACTIONSTATE, (void*)hk_GetState,      (void**)&o_GetState,      "CharacterBase.getActionState",          false },
+    { RVA_CB_GETBASEACTION,  (void*)hk_GetBaseAction, (void**)&o_GetBaseAction, "CharacterBase.get_BaseCurrentAction",   false },
+    { RVA_PCE_GETCANCELSEQ,  (void*)hk_GetSeq,        (void**)&o_GetSeq,        "PCE.getCancelMotionSeq",                false },
+    { RVA_PCC_UPDATE,        (void*)hk_CtrlUp,        (void**)&o_CtrlUp,        "PCC.update",                            false },
+    { RVA_PAS_UPDATE,        (void*)hk_SelUp,         (void**)&o_SelUp,         "PAS.update",                            false },
 };
+static constexpr size_t kHookCount = sizeof(g_hooks) / sizeof(g_hooks[0]);
 
 static int InstallAll() {
     if (MH_Initialize() != MH_OK) { Log("[-] MH_Initialize failed"); return 0; }
@@ -359,17 +389,25 @@ static int InstallAll() {
         void* t = (void*)(kBase + h.rva);
         MH_STATUS s1 = MH_CreateHook(t, h.fn, h.orig);
         MH_STATUS s2 = (s1 == MH_OK) ? MH_EnableHook(t) : s1;
-        if (s2 != MH_OK) Log("[-] %s failed (%d)", h.name, (int)s2);
-        else { Log("[+] %s hooked @ 0x%llX", h.name, (unsigned long long)h.rva); h.ok = true; ok++; }
+        if (s2 != MH_OK) {
+            Log("[-] %s failed (%d)", h.name, (int)s2);
+        } else {
+            Log("[+] %s hooked @ 0x%llX", h.name, (unsigned long long)h.rva);
+            h.ok = true;
+            ok++;
+        }
     }
     return ok;
 }
+
 static void UninstallAll() {
     for (auto& h : g_hooks) if (h.ok) MH_DisableHook((void*)(kBase + h.rva));
     MH_Uninitialize();
     Log("[i] hooks removed");
 }
 
+// ─────────────────────────────────────────────────────────────
+// Main
 // ─────────────────────────────────────────────────────────────
 static DWORD WINAPI MainThread(LPVOID) {
     LoadConfig(true);
@@ -387,7 +425,8 @@ static DWORD WINAPI MainThread(LPVOID) {
         Log("[+] build verified: %p", mod);
         int n = InstallAll();
         if (n == 0) { Log("[-] no hooks"); return 0; }
-        Log("[+] DUMP READY (%d hooks). Play: light attack x3, hard attack, dodge, guard, parry.", n);
+        Log("[+] DUMP READY (%d hooks).", n);
+        Log("[+] Play: light attack x3, hard attack, dodge, guard, parry.");
         return 0;
     }
     Log("[-] game not found");
@@ -397,7 +436,8 @@ static DWORD WINAPI MainThread(LPVOID) {
 BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(h);
-        char p[MAX_PATH]; GetModuleFileNameA(h, p, MAX_PATH);
+        char p[MAX_PATH];
+        GetModuleFileNameA(h, p, MAX_PATH);
         g_log_path = p;
         size_t s = g_log_path.find_last_of("\\/");
         g_log_path = (s == std::string::npos ? "" : g_log_path.substr(0, s + 1)) + "OnimushaMod_log.txt";
